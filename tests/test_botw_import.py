@@ -141,10 +141,12 @@ class BotwImport(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b'test')
         (tree / 'build/shader-seed/botw160/seed-manifest.json').write_text(json.dumps(dict(
-            version='botw160', chain='totk-native-v8-unverified', shaders=2000,
+            version='botw160', chain='totk-native-v9-unverified', shaders=2000,
             files={'pso_manifest.tsv': hashlib.sha256(b'test').hexdigest()})))
         out = self.root / 'BotW.app'
-        with patch.object(build_app, 'sign_app'), patch.object(build_app, 'app_seal_valid', return_value=True):
+        with patch.object(build_app, 'sign_app'), patch.object(build_app, 'app_seal_valid', return_value=True), \
+                patch.object(build_app, 'resolve_lists') as lists:
             build_app.step_app(tree, out, self.root / 'logs', version='botw160', game='botw')
+        self.assertEqual(lists.call_args[0][2], 'botw')   # the Breath of the Wild list
         self.assertTrue((out / 'Contents/MacOS/BotW').is_file())
         self.assertFalse((out / 'Contents/Resources/totk/extracted/botw160/aoc').exists())

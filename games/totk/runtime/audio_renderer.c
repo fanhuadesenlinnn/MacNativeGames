@@ -360,7 +360,22 @@ static void manager_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs
     }
 }
 
-void runtime_audio_register(void) { runtime_ipc_register("audren:u", manager_handler, NULL, NULL); }
+#ifdef GAME_NS2
+/* aud:u, the Switch 2's audio user service (SDK 20.5 Ounce: nn::audio::CreateUserClientSessionByHipc). Its client hands out
+   the audio renderer manager, which this host serves as audren:u's. Discovery (2026-11-03, Donkey Kong Bananza): every
+   command is logged with its id; the ones that open a manager are named below once seen. Open: the rest of the service. */
+static void user_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
+    fprintf(stderr, "[totk-audio] aud:u command %u (type %u, %u bytes of arguments, %u copy / %u move handles)\n", rq->cmd, rq->type, (unsigned)rq->data_size, rq->ncopy, rq->nmove);
+    (void)s;
+    rs->move[rs->nmove++] = runtime_ipc_new_session("IAudioRendererManager", manager_handler, NULL, NULL);
+}
+#endif
+void runtime_audio_register(void) {
+    runtime_ipc_register("audren:u", manager_handler, NULL, NULL);
+#ifdef GAME_NS2
+    runtime_ipc_register("aud:u", user_handler, NULL, NULL);
+#endif
+}
 __attribute__((constructor)) static void register_audio(void) { runtime_audio_register(); }
 
 /* ---------- make probe-audio: mixer checks on constructed renderer state (no game, no audio device) ---------- */
@@ -482,6 +497,7 @@ static int probe_ramp_edge(int kind) {
 #endif
 void runtime_audio_probe(void) {
     setenv("TOTK_AUDIO_OFF", "1", 1);
+    setenv("TOTK_AUDIO_CHANNELS", "2", 1);
     const int neg = getenv("TOTK_PROBE_NEGATIVE") != NULL;
     AudrenParameter p = {48000, 240, 8, 1, 4, 1, 2, 0, 0, 0, 0, 0, 1, 2, 0, REV(11)};
     AudioRenderer *r = renderer_new(&p); audio_mixer_open(r);

@@ -21,8 +21,8 @@ The launcher points `TOTK_ROMFS_MODS` at
 ~/Library/Application Support/MacNativeGames/TOTK/mods/<version>
 ```
 
-where `<version>` is the game version the app was built from: `v0` (1.0.0), `v112` (1.1.2), `v121`
-(1.2.1) or `v143` (1.4.3).
+where `<version>` is the game version the app was built from: `v0` (1.0.0), `v121` (1.2.1) or
+`v143` (1.4.3).
 
 When no controller is connected at start and `mods/<version>-keyboard/manifest.tsv` exists, the launcher points
 `TOTK_ROMFS_MODS` at that folder instead, so the prompts show the Mac keyboard's keys while you play on the keyboard:
@@ -259,21 +259,42 @@ rebuilds the overlay from the retail table instead of keeping the mod's heap siz
 ### Large texture packs (8 GB mode)
 
 Some texture packs are made for an emulator's 8 GB DRAM mode and do not fit the 3.2 GiB a retail console gives the game.
-One such pack is the **[Tears of the Kingdom 4K Texture Pack by HDPacks](https://www.hdpacks.com/)** (made by
-HDPacks.com, who offer it as a free download on their site; it is their work and is not part of this repository: get it
-from them and follow their terms). Played on the Mac with 1.4.3:
+For a separate, manually enabled texture overlay, prepare the pack outside the source checkout:
 
-1. Put the pack's `romfs` files (for the HDPacks pack, `4kTextures/RomFS`) into the version's mod folder
+```sh
+python3.14 games/totk/scripts/install_texture_pack.py "/path/to/pack/RomFS" \
+    --app "/path/to/Tears of the Kingdom.app" --version v143 --output "/path/to/installed-textures"
+printf '%s\n' '/path/to/installed-textures' > "$HOME/Library/Application Support/MacNativeGames/TOTK/texture-pack-path.txt"
+```
+
+The pack is **off by default** and has no in-game settings entry. A legacy `texture-pack.txt` is ignored.
+To enable it explicitly for one launch:
+
+```sh
+open --env TOTK_TEXTURE_PACK=1 "/path/to/Tears of the Kingdom.app"
+```
+
+The enabled pack loads its checked texture overlay and selects the 8 GB memory layout. An ordinary launch keeps stock
+textures, size tables and memory layout. The installer fits the size tables to the app's game version and preserves
+all installed canvas-heap increments. Reinstall to a new output folder after changing the pack, game version or canvas
+modes, then update the saved path. `TOTK_TEXTURE_PACK_DIR` overrides the path. A conflicting `TOTK_DRAM_8GB=0`, missing
+files or another mod replacing the same size table stops startup with a log message. This feature is for Mac TOTK.
+
+For the older workflow that merges texture files into the player's other mods:
+
+Texture packs are the work of their respective authors and are not included in this repository. For manual installation
+on the Mac with 1.4.3:
+
+1. Put the pack's `romfs` files (for example, `4kTextures/RomFS`) into the version's mod folder
    (`mods/v143`), together with any other mod you use.
-2. The pack's heap table and resource size tables are made for the version it was built for (the HDPacks pack: up to
-   1.2.1). Fit them to the app's version:
+2. The pack's heap table and resource size tables are made for the version it was built for. Fit them to the app's version:
 
    ```sh
    python3.14 games/totk/scripts/texture_pack_tables.py ~/Library/Application\ Support/MacNativeGames/TOTK/mods/v143 \
        --app "Tears of the Kingdom.app"
    ```
 
-   It writes 1.4.3's own `HeapDef` with only the heaps the pack makes bigger raised (for the HDPacks pack: `TextureHeap`,
+   It writes 1.4.3's own `HeapDef` with only the heaps the pack makes bigger raised (for example: `TextureHeap`,
    `ゲームグラフィックス` and `草`), and 1.4.3's `ResourceSizeTable.Product.143` with every replaced texture's entry grown
    by as much as the file grew. Then write the manifest with `make_mod_manifest.py` as usual. Run both again whenever
    the folder changes.
@@ -283,9 +304,8 @@ from them and follow their terms). Played on the Mac with 1.4.3:
    open --env TOTK_DRAM_8GB=1 "Tears of the Kingdom.app"
    ```
 
-   `TOTK_DRAM_8GB` reports a 6.8 GiB application pool to the game (as the emulators' 8 GB mode does) and lets one
-   memory pool be a zero-copy GPU buffer of up to 4 GiB (the pack's `TextureHeap` pool is about 3.8 GiB; the limit is
-   1 GiB otherwise).
+   `TOTK_DRAM_8GB` reports a 6.8 GiB application pool to the game (as the emulators' 8 GB mode does); the pack's
+   `TextureHeap` pool, about 3.8 GiB, becomes one zero-copy GPU buffer.
 
 Checked on a 24 GB M-series Mac: about 8.7 GB resident in play and the GPU near full load (the GPU is the
 bottleneck). A Mac with less memory than that is not expected to run it.
@@ -316,6 +336,25 @@ Check `grep "mods/botw160 checked" ~/Library/Logs/MacNativeGames/botw.log | tail
 - The game's language follows the app's preferred language, which also picks the language folder a mod must use (`USen` for
   `en-US`). To give only this game another language:
   `defaults write org.macnativegames.botw AppleLanguages -array en-US`.
+
+Button icons that follow your controls (1.9.0, an Xbox or PlayStation controller): the builder's Controls tab
+("Update the game's button icons"), or by hand after you change the layout, makes a mod in which each prompt shows the
+button that drives that input, read from `controls.txt` (the A prompt shows B while the right face button does A):
+
+```bash
+python3 games/totk/scripts/make_botw_button_icons.py "$HOME/Library/Application Support/MacNativeGames/BotW/mods/botw190" \
+  --app "/path/to/Breath of the Wild.app"
+```
+
+It draws nothing: the icon font already holds every button, so each input's code point is pointed at the icon of its
+button (LB RB LT RT show as L R ZL ZR, Menu and View as + and -). The action guide beside an object ("A Open") becomes
+the Xbox diamond, A at the bottom, B right, X left, Y top, with the button that does the action lit in its place (an
+action of A, B, X or Y moved to a button outside the diamond, such as LB, keeps the Switch's diamond there; its prompt in
+the text still names LB).
+PlayStation controllers get the Xbox letters, and a Nintendo controller (`controller-type.txt` saying `switch`) keeps the
+game's own icons, which already name its buttons. The mod replaces the seven `Font/Font_*.sbfarc` and
+`Pack/Bootup.pack` (whose `Layout/Common.sblarc` holds the guide); the layouts keep their size, so no size table is
+needed, but another mod that replaces `Pack/Bootup.pack` cannot be used with it.
 
 ### Notes
 
@@ -415,7 +454,7 @@ These come from how a pack was built, not from its content, and none of them pri
 ~/Library/Application Support/MacNativeGames/TOTK/mods/<version>
 ```
 
-`<version>` 是构建这个 App 时使用的游戏版本：`v0`（1.0.0）、`v112`（1.1.2）、`v121`（1.2.1）、
+`<version>` 是构建这个 App 时使用的游戏版本：`v0`（1.0.0）、`v121`（1.2.1）、
 `v143`（1.4.3）。
 
 启动时没有连接手柄、且 `mods/<version>-keyboard/manifest.tsv` 存在时，启动器改把 `TOTK_ROMFS_MODS` 指向那个目录，
@@ -620,19 +659,40 @@ mod 的 `exefs/` 里可能还有这些文件，构建这样处理：
 
 ### 大型材质包（8 GB 模式）
 
-有些材质包是给模拟器的 8 GB DRAM 模式做的，装不进真机给游戏的 3.2 GiB。例如 **[HDPacks 的王国之泪 4K 材质包](https://www.hdpacks.com/)**
-（HDPacks.com 制作，可在其网站免费下载；这是他们的作品，不在本仓库里：请从他们那里获取并遵守他们的条款）。在 Mac 上配合
-1.4.3 使用：
+需要手动启用独立材质层时，先把材质包安装到源码目录外的文件夹：
 
-1. 把材质包的 `romfs` 文件（HDPacks 的包是 `4kTextures/RomFS`）和你用的其他 mod 一起放进该版本的 mod 文件夹（`mods/v143`）。
-2. 材质包自带的堆表和资源尺寸表是按它对应的版本做的（HDPacks 的包最高到 1.2.1），先改成 App 的版本：
+```sh
+python3.14 games/totk/scripts/install_texture_pack.py "/材质包路径/RomFS" \
+    --app "/游戏路径/Tears of the Kingdom.app" --version v143 --output "/外置盘/已安装材质"
+printf '%s\n' '/外置盘/已安装材质' > "$HOME/Library/Application Support/MacNativeGames/TOTK/texture-pack-path.txt"
+```
+
+材质包**默认关闭，设置中没有入口**，旧的 `texture-pack.txt` 开启记录不再生效。
+仅在需要时显式启用一次：
+
+```sh
+open --env TOTK_TEXTURE_PACK=1 "/游戏路径/Tears of the Kingdom.app"
+```
+
+启用时一起加载经过校验的材质、容量表和 8 GB 内存布局；普通启动保留原版资源与内存布局。
+安装工具按 App 的实际游戏版本生成容量表，并保留各档分辨率的堆增量。更新材质包、游戏版本或画布档位后，
+安装到新目录并修改路径文件。`TOTK_TEXTURE_PACK_DIR` 可覆盖路径；显式关闭 8 GB 布局、文件缺失或其他模组
+替换同一容量表时会停止启动并记录原因。此功能只用于 Mac 的王国之泪。
+
+下面是把材质与其他模组合并的旧用法：
+
+有些材质包是给模拟器的 8 GB DRAM 模式做的，装不进真机给游戏的 3.2 GiB。材质包属于各自作者，不包含在本仓库中。
+在 Mac 上手动配合 1.4.3 使用：
+
+1. 把材质包的 `romfs` 文件（例如 `4kTextures/RomFS`）和你用的其他 mod 一起放进该版本的 mod 文件夹（`mods/v143`）。
+2. 材质包自带的堆表和资源尺寸表是按它对应的版本做的，先改成 App 的版本：
 
    ```sh
    python3.14 games/totk/scripts/texture_pack_tables.py ~/Library/Application\ Support/MacNativeGames/TOTK/mods/v143 \
        --app "Tears of the Kingdom.app"
    ```
 
-   它写出 1.4.3 自己的 `HeapDef`，只把材质包加大的堆调大（HDPacks 的包：`TextureHeap`、`ゲームグラフィックス`、`草`），
+   它写出 1.4.3 自己的 `HeapDef`，只把材质包加大的堆调大（例如 `TextureHeap`、`ゲームグラフィックス`、`草`），
    并写出 1.4.3 的 `ResourceSizeTable.Product.143`，每个被替换贴图的条目按文件变大的量加大。然后照常用
    `make_mod_manifest.py` 生成清单。文件夹有变化时两步都要重跑。
 3. 用 8 GB 模式启动：
@@ -641,8 +701,8 @@ mod 的 `exefs/` 里可能还有这些文件，构建这样处理：
    open --env TOTK_DRAM_8GB=1 "Tears of the Kingdom.app"
    ```
 
-   `TOTK_DRAM_8GB` 向游戏报告 6.8 GiB 的应用内存池（和模拟器的 8 GB 模式一样），并允许单个内存池做成最大 4 GiB 的零拷贝
-   GPU 缓冲（材质包的 `TextureHeap` 池约 3.8 GiB，平时上限 1 GiB）。
+   `TOTK_DRAM_8GB` 向游戏报告 6.8 GiB 的应用内存池（和模拟器的 8 GB 模式一样）；材质包约 3.8 GiB 的 `TextureHeap`
+   池做成一个零拷贝 GPU 缓冲。
 
 在 24 GB 的 Apple 芯片 Mac 上验证：游玩时常驻内存约 8.7 GB，GPU 接近满载（瓶颈在 GPU）。内存更小的 Mac 预计跑不动。
 
@@ -669,6 +729,21 @@ python3 games/totk/scripts/make_mod_manifest.py "$MODDIR" --app "/path/to/Breath
   `Pack/Bootup_<语言>.pack` 变大的翻译 mod）。
 - 游戏语言跟随 App 的首选语言，也由它决定 mod 要放在哪个语言目录（`en-US` 对应 `USen`）。只给这个游戏换语言：
   `defaults write org.macnativegames.botw AppleLanguages -array en-US`。
+
+跟随你的按键设置的按钮图标（1.9.0，Xbox 或 PlayStation 手柄）：在 builder 的 Controls 页点“Update the game's button
+icons”，或者改完布局后手动运行，生成一个 mod，让每个提示显示实际执行该输入的按钮（读取 `controls.txt`；右侧面键执行 A
+时，A 的提示显示 B）：
+
+```bash
+python3 games/totk/scripts/make_botw_button_icons.py "$HOME/Library/Application Support/MacNativeGames/BotW/mods/botw190" \
+  --app "/path/to/Breath of the Wild.app"
+```
+
+它不画任何东西：图标字体里已经有每个按钮，所以只是把每个输入的码位指向对应按钮的图标（LB RB LT RT 显示为 L R ZL ZR，Menu
+和 View 显示为 + 和 -）。物体旁的操作提示（“A 打开”）变成 Xbox 的菱形：A 在下、B 在右、X 在左、Y 在上，执行该操作的按钮在
+它的位置上高亮（A、B、X、Y 的操作若移到菱形之外的按钮，例如 LB，那里保留 Switch 的菱形；文字里的提示仍显示 LB）。PlayStation 手柄显示 Xbox 字母；任天堂手柄（`controller-type.txt` 为 `switch`）保留游戏自己的图标，它们本来
+就对应手柄上的按钮。mod 替换七个 `Font/Font_*.sbfarc` 和 `Pack/Bootup.pack`（其中的 `Layout/Common.sblarc` 存放操作提示）；
+布局大小不变，所以不需要资源大小表，但不能和另一个替换 `Pack/Bootup.pack` 的 mod 一起使用。
 
 ### 注意
 
