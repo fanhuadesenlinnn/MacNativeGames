@@ -1,10 +1,13 @@
 """The player's contribution file (totk_shader_contrib.h): written by the runtime, merged by scripts/shader_list.py."""
 import json
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.request
+from unittest import mock
 from pathlib import Path
 
 TOTK = Path(__file__).resolve().parents[1] / 'games/totk'
@@ -42,7 +45,7 @@ class ContributionFileTests(unittest.TestCase):
             game = subprocess.run([str(probe), str(contrib), 'game'], capture_output=True, text=True)   # the iPhone / iPad app's tag
             self.assertEqual(game.returncode, 0, game.stderr)
             self.assertEqual(json.loads(game.stdout)['status'], 'pass')
-            self.assertEqual(watch.contribution_game(contrib.read_text()), 'TOTK 1.4.3')
+            self.assertIn('\n# Game: TOTK 1.4.3\n', contrib.read_text())
             prune = subprocess.run([str(probe), str(contrib), 'prune'], capture_output=True, text=True)   # served and sent rows leave
             self.assertEqual(prune.returncode, 0, prune.stderr)
             self.assertEqual(json.loads(prune.stdout)['status'], 'pass')
@@ -69,18 +72,12 @@ class IssueCollectionTests(unittest.TestCase):
         self.assertEqual(attachment_urls(None), [])
 
     def test_an_automatic_submission_is_read_like_a_form_issue(self):
-        link = watch.gist_raw('https://gist.github.com/someone/0123abcd\n')
-        self.assertEqual(link, 'https://gist.githubusercontent.com/someone/0123abcd/raw/shader-list-contribution.txt')
-        self.assertIsNone(watch.gist_raw('error: HTTP 401'))
-        body = watch.issue_body('iPad', link)
+        # How the gh submissions of the Mac's device reminder laid out their issues (the reminder went on 2026-11-10: the
+        # devices contribute over HTTPS now); issues sent that way are still merged.
+        link = 'https://gist.githubusercontent.com/someone/0123abcd/raw/shader-list-contribution.txt'
+        body = ('### Game version / 游戏版本\n\n1.4.3\n\n### Device / 设备\n\niPhone\n\n'
+                f'### shader-list-contribution.txt\n\n{link}\n\n### Where you played (optional) / 玩了哪些地方（可选）\n\n_No response_\n')
         self.assertEqual(attachment_urls(body), [link])
-        self.assertIn('### Device / 设备\n\niPad\n', body)
-        self.assertNotIn('udid', body.lower())
-        self.assertIn('### Game version / 游戏版本\n\nSent automatically / 自动提交\n', body)   # an app from before the tag
-        tagged = watch.issue_body('iPhone', link, 'TOTK 1.4.3')   # the device's file names its game and version (2026-10-29)
-        self.assertIn('### Game version / 游戏版本\n\n1.4.3\n\n### Device / 设备\n\niPhone\n', tagged)
-        self.assertEqual(watch.contribution_game('# x\n# Game: TOTK 1.2.1\nV\ta\t{}\n# Game: TOTK 1.4.3\n'), 'TOTK 1.4.3')
-        self.assertIsNone(watch.contribution_game('# Game: TOTK\n# Game: TOTK 1.4.3 and more\nV\ta\t{}\n'))
 
     def test_only_shader_rows_are_taken(self):
         text = '\n'.join([
@@ -337,94 +334,102 @@ class OcarinaOfTimeTests(unittest.TestCase):
             self.assertIn(f'V\t{key}\t{{}}', text)
 
 
-sys.path.insert(0, str(TOTK / 'ios/tools'))
-import shader_contrib_watch as watch  # noqa: E402
+class ShaderInboxTests(unittest.TestCase):
+    """Rows the apps sent over HTTPS (the shader inbox) merge as an issue titled for the game they name."""
+    KEY_A, KEY_W = 'a' * 64, 'c' * 64
+
+    @staticmethod
+    def pending(rows):
+        return [{'id': str(i + 1), 'kind': r[0], 'body': r, 'players': 1, 'versions': ['1.0.0'], 'platforms': ['mac']}
+                for i, r in enumerate(rows)]
+
+    def merge(self, by_game, keys=None):
+        keys = keys or {g: set() for g in collect_shader_issues.GAMES}
+        lists = {g: ShaderList() for g in collect_shader_issues.GAMES}
+        with mock.patch.object(collect_shader_issues, 'inbox_pending', lambda base, token, game: by_game.get(game, [])):
+            done = collect_shader_issues.merge_inbox('https://inbox.test', 't', lists, keys, {}, False)
+        return lists, keys, {game: (line, ids) for line, game, ids in done}
+
+    def test_rows_go_to_the_game_the_app_named(self):
+        lists, keys, done = self.merge({'wonder': self.pending([f'V\t{self.KEY_W}\t{{}}'])})
+        self.assertEqual(lists['wonder'].variants, {(self.KEY_W, '{}')})
+        self.assertEqual(done['wonder'][1], ['1'])
+        self.assertIn(self.KEY_W, keys['wonder'], 'teaches plain-titled issues the game\'s keys')
+
+    def test_a_seeded_game_takes_rows_no_seed_names(self):
+        lists, _, done = self.merge({'botw': self.pending([f'V\t{self.KEY_W}\t{{}}', f'V\t{self.KEY_A}\t{{}}'])})
+        self.assertEqual(lists['botw'].variants, {(self.KEY_W, '{}'), (self.KEY_A, '{}')})
+        self.assertEqual(lists['totk'].variants, set())
+        self.assertEqual(done['botw'][1], ['1', '2'])
+
+    def test_a_failed_export_takes_nothing(self):
+        def broken(base, token, game):
+            raise ValueError('/v1/export: HTTP 401 unauthorized')
+        lists = {g: ShaderList() for g in collect_shader_issues.GAMES}
+        with mock.patch.object(collect_shader_issues, 'inbox_pending', broken):
+            done = collect_shader_issues.merge_inbox('https://inbox.test', 't', lists, {g: set() for g in lists}, {}, False)
+        self.assertTrue(done and all(ids == [] and 'HTTP 401' in line for line, _, ids in done))
+
+    def test_pending_follows_the_pages(self):
+        pages = {0: {'rows': [{'id': '1'}, {'id': '2'}], 'next': '2'}, 2: {'rows': [{'id': '3'}], 'next': None}}
+        asked = []
+        def call(base, token, path, payload=None):
+            asked.append(path)
+            return pages[int(path.split('after=')[1].split('&')[0])]
+        with mock.patch.object(collect_shader_issues, 'inbox_call', call):
+            rows = collect_shader_issues.inbox_pending('https://inbox.test', 't', 'totk')
+        self.assertEqual([r['id'] for r in rows], ['1', '2', '3'])
+        self.assertEqual(len(asked), 2)
+        self.assertTrue(all(p.startswith('/v1/export?game=totk&') for p in asked))
 
 
-class MacReminderForDevicesTests(unittest.TestCase):
-    def test_only_paired_reachable_ios_devices(self):
-        listing = {'result': {'devices': [
-            {'identifier': 'A', 'deviceProperties': {'name': 'iPhone'}, 'hardwareProperties': {'platform': 'iOS', 'udid': 'u-a'},
-             'connectionProperties': {'pairingState': 'paired', 'transportType': 'localNetwork', 'tunnelState': 'disconnected'}},
-            {'identifier': 'B', 'deviceProperties': {'name': 'iPad'}, 'hardwareProperties': {'platform': 'iOS', 'udid': 'u-b'},
-             'connectionProperties': {'pairingState': 'paired'}},                                   # not reachable now
-            {'identifier': 'E', 'deviceProperties': {'name': 'Tablet'}, 'hardwareProperties': {'platform': 'iOS', 'udid': 'u-e', 'deviceType': 'iPad'},
-             'connectionProperties': {'pairingState': 'paired', 'transportType': 'wired'}},
-            {'identifier': 'C', 'hardwareProperties': {'platform': 'watchOS'}, 'connectionProperties': {'pairingState': 'paired', 'transportType': 'wired'}},
-            {'identifier': 'D', 'hardwareProperties': {'platform': 'iOS'}, 'connectionProperties': {'pairingState': 'unpaired', 'transportType': 'wired'}}]}}
-        self.assertEqual(watch.reachable_devices(listing), [('A', 'u-a', 'iPhone', 'iPhone'), ('E', 'u-e', 'Tablet', 'iPad')])
-        self.assertEqual(watch.reachable_devices({}), [])
+# The inbox is a project of its own (not in this repository): $SHADER_INBOX_DIR, else MacNativeGamesWeb/shader-inbox beside it.
+INBOX = Path(os.environ.get('SHADER_INBOX_DIR') or TOTK.parents[2] / 'MacNativeGamesWeb/shader-inbox')
 
-    def test_the_game_is_found_by_name_or_bundle(self):
-        self.assertEqual(watch.game_bundle({'result': {'apps': [{'name': 'Other', 'bundleIdentifier': 'x.y'},
-                                                                 {'name': 'Tears of the Kingdom', 'bundleIdentifier': 'com.someone.totk'}]}}), 'com.someone.totk')
-        self.assertEqual(watch.game_bundle({'result': {'apps': [{'name': 'TOTK', 'bundleIdentifier': 'org.macnativegames.totk'}]}}), 'org.macnativegames.totk')
-        self.assertIsNone(watch.game_bundle({'result': {'apps': [{'name': 'Other', 'bundleIdentifier': 'x.y'}]}}))
 
-    def test_rows_and_every_100(self):
-        text = '# header\n' + ''.join(f'V\t{i:064x}\t{{}}\n' for i in range(3)) + f'V\t{0:064x}\t{{}}\n' + 'R\tab\n' + 'R\tab\n'
-        self.assertEqual(watch.contribution_rows(text), 4)   # shaders and pipelines together
-        self.assertFalse(watch.due(99, 0)); self.assertTrue(watch.due(100, 0))
-        self.assertFalse(watch.due(199, 100)); self.assertTrue(watch.due(200, 100))
+@unittest.skipUnless(shutil.which('xcrun') and shutil.which('node') and (INBOX / 'node_modules/@electric-sql/pglite').is_dir(),
+                     'needs the Xcode command line tools, node and the shader inbox (SHADER_INBOX_DIR) with npm install')
+class ShaderInboxUploadTests(unittest.TestCase):
+    """The app's upload (totk_contrib_upload.h) against the inbox's own handlers on 127.0.0.1 (test/local-server.js)."""
 
-    def test_a_device_s_rows_are_merged_into_the_one_file(self):
-        with tempfile.TemporaryDirectory() as d:
-            d = Path(d); phone, mine = d / 'phone.txt', d / 'shader-list-contribution.txt'
-            mine.write_text('# Mac\nR\tab\nV\t' + 'a' * 64 + '\t{}\n')
-            phone.write_text('# phone\nR\tab\nR\tcd\nR\tcd\nB\tcd\t-\t-\n')
-            self.assertEqual(watch.merge_rows(phone, mine), 4)      # ab and the V row, then cd and its B row once
-            self.assertEqual(watch.merge_rows(phone, mine), 4)      # nothing new the second time
-            fresh = d / 'new.txt'
-            self.assertEqual(watch.merge_rows(phone, fresh), 3)
-            self.assertTrue(fresh.read_text().startswith('# '))
+    def build(self, tmp, url):
+        probe = tmp / f'probe-{len(list(tmp.iterdir()))}'
+        build = subprocess.run(['xcrun', 'clang', '-fobjc-arc', '-Wall', '-Wextra', '-Werror', f'-DTOTK_CONTRIB_INBOX="{url}"',
+                                f'-I{TOTK}/third_party/d2r_gfx/gfx/nvn', str(TOTK / 'tests/shader_contrib/inbox_probe.m'),
+                                '-framework', 'Foundation', '-o', str(probe)], capture_output=True, text=True)
+        self.assertEqual(build.returncode, 0, build.stderr[-600:])
+        return probe
 
-    def test_rows_sent_or_served_are_not_merged_again(self):
-        with tempfile.TemporaryDirectory() as d:
-            d = Path(d); phone, mine = d / 'phone.txt', d / 'shader-list-contribution.txt'
-            done = d / '.shader-list-contribution.txt.done'   # totk_shader_contrib.h totk_contrib_side(path, "done")
-            mine.write_text('# Mac\nR\tab\n')
-            done.write_text('R\tcd\n')
-            phone.write_text('# phone\nR\tcd\nT\tef\t1:0;\nV\t' + 'a' * 64 + '\t{}\n')
-            self.assertEqual(watch.merge_rows(phone, mine), 3)      # ab, the T row and the V row; cd was sent
-            self.assertNotIn('R\tcd', mine.read_text())
+    def test_rows_go_to_the_inbox_once_and_leave_the_file(self):
+        server = subprocess.Popen(['node', str(INBOX / 'test/local-server.js')], cwd=INBOX, stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, text=True)
+        try:
+            port = int(server.stdout.readline().split()[1])
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp = Path(tmp)
+                probe = self.build(tmp, f'http://127.0.0.1:{port}/v1/contrib')
+                run = subprocess.run([str(probe), str(tmp / 'shader-list-contribution.txt'), 'up'], capture_output=True, text=True, timeout=120)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                result = json.loads(run.stdout)
+                self.assertEqual(result['status'], 'pass')
+                with urllib.request.urlopen(f'http://127.0.0.1:{port}/admin/rows?game=totk', timeout=30) as reply:
+                    rows = json.loads(reply.read())['data']['rows']
+                self.assertEqual(sorted(r['kind'] for r in rows), ['B', 'R', 'V'])
+                self.assertTrue(all(r['players'] == 1 and r['versions'] == ['1.4.3'] and r['platforms'] == ['mac'] for r in rows))
+                with urllib.request.urlopen(f'http://127.0.0.1:{port}/admin/uploads?game=totk', timeout=30) as reply:
+                    uploads = json.loads(reply.read())['data']
+                model = subprocess.run(['sysctl', '-n', 'hw.model'], capture_output=True, text=True).stdout.strip()
+                self.assertEqual([(u['install'], u['platform'], u['device'], u['game_version'], u['shaders_sent'], u['pipelines_sent'])
+                                  for u in uploads], [(result['install'], 'mac', model, '1.4.3', 1, 2)],
+                                 'one upload: this Mac\'s model, the rows by kind')
+                self.assertRegex(uploads[0]['os'], r'^macOS \d+\.\d+\.\d+$')
+        finally:
+            server.stdin.close(); server.wait(timeout=30); server.stdout.close()
 
-    def test_a_sent_file_keeps_only_what_came_after(self):
-        with tempfile.TemporaryDirectory() as d:
-            d = Path(d); mine = d / 'shader-list-contribution.txt'
-            done, state = d / '.shader-list-contribution.txt.done', d / '.shader-list-contribution.txt.reminded'
-            mine.write_text('# Mac\n# Game: TOTK 1.4.3\nR\tab\nR\tcd\nT\tef\t1:0;\n')
-            state.write_text('3\n')
-            self.assertEqual(watch.retire(mine, {'R\tab', 'T\tef\t1:0;'}), 2)
-            self.assertEqual(mine.read_text(), '# Mac\n# Game: TOTK 1.4.3\nR\tcd\n')
-            self.assertEqual(set(done.read_text().splitlines()), {'R\tab', 'T\tef\t1:0;'})
-            self.assertEqual(state.read_text(), '1\n')                # the reminder counts from the row left
-            state.write_text('never\n')
-            watch.retire(mine, {'R\tcd'})
-            self.assertEqual(state.read_text(), 'never\n')
-
-    def test_agent_runs_check_every_ten_minutes_with_the_xcode(self):
-        plist = watch.agent_plist('/usr/bin/python3', Path('/x/shader_contrib_watch.py'), '/X/Xcode.app/Contents/Developer')
-        self.assertEqual(plist['ProgramArguments'], ['/usr/bin/python3', '/x/shader_contrib_watch.py', 'check'])
-        self.assertEqual(plist['StartInterval'], 600)
-        stored = watch.agent_plist('/usr/bin/python3', Path('/x/w.py'), '/X', Path('/Users/me/MacNativeGames/shader-list-contribution'))
-        self.assertEqual(stored['ProgramArguments'][2:], ['check', '--store', '/Users/me/MacNativeGames/shader-list-contribution'])   # the clone
-        self.assertEqual(plist['EnvironmentVariables'], {'DEVELOPER_DIR': '/X/Xcode.app/Contents/Developer'})
-        self.assertFalse(plist['RunAtLoad'])
-
-    def test_never_stops_the_reminders(self):
-        self.assertEqual(watch.reminded_at(''), 0)
-        self.assertEqual(watch.reminded_at('500\n'), 500)
-        self.assertIsNone(watch.reminded_at('never\n'))
-        self.assertEqual(watch.message(500, 'iPad')[2:], ('Remind me next time', "Don't remind me again", 'Send')
-                         if not watch.chinese() else ('下次提醒', '不要提醒了', '发送'))
-
-    def test_gh_replaces_remind_me_next_time_with_submit(self):
-        self.assertEqual(watch.message(500, 'iPad', auto=True)[2:], ('Submit automatically', "Don't remind me again", 'Send')
-                         if not watch.chinese() else ('自动提交', '不要提醒了', '发送'))
-        with tempfile.TemporaryDirectory() as tmp:   # no gh on PATH or in the usual places: no automatic button
-            old = (watch.GH_CANDIDATES, watch.shutil.which)
-            watch.GH_CANDIDATES, watch.shutil.which = (str(Path(tmp) / 'gh'),), lambda name: None
-            try:
-                self.assertIsNone(watch.gh_path())
-            finally:
-                watch.GH_CANDIDATES, watch.shutil.which = old
+    def test_without_an_answer_the_rows_stay(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            probe = self.build(tmp, 'http://127.0.0.1:9/v1/contrib')   # the discard port: nothing listens
+            run = subprocess.run([str(probe), str(tmp / 'shader-list-contribution.txt'), 'down'], capture_output=True, text=True, timeout=120)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(json.loads(run.stdout)['status'], 'pass')
