@@ -1997,6 +1997,13 @@ def mac_pipeline_files(made, seed, arch, chain):
         index += [f'{key}\t{archive.stem}' for key in keys.read_text().split('\n') if key]
     if not index:
         return 0
+    # #2070: the compute shaders this GPU's Metal compiler built only with their float adds lowered (nvn_float_rmw.h): the
+    # app takes the lowered form at once instead of crashing the compiler service on the native one at its first start.
+    lowered = made / 'float-rmw-lowered.txt'
+    keys = sorted({c[1] for c in (line.split('\t') for line in lowered.read_text().splitlines()) if len(c) == 2 and c[0] == arch and c[1]}
+                  ) if lowered.is_file() else []
+    if keys:
+        (seed / f'pipelines-{arch}-lowered.txt').write_text('\n'.join(keys) + '\n')
     (seed / f'pipelines-{arch}.tsv').write_text('\n'.join(index) + '\n')
     (seed / f'pipelines-{arch}.json').write_text(json.dumps({'schema': PAR_SCHEMA, 'chain': chain, 'arch': arch,
                                                              'pipelines': len(index)}, indent=1) + '\n')
@@ -2319,7 +2326,8 @@ def main_ns2(args, dump):
                 logs / f'output_res_overlay-{v}-{size}.log', cwd=tree, env=env)
     icon_spec = g['folder'] / 'assets/app-icon.json'
     if icon_spec.is_file():
-        run([py, 'scripts/extract_app_icon.py', '--source-spec', icon_spec, '--output', 'build/AppIcon.icns'],
+        # the work tree's Python: extract_app_icon imports extract_exefs, which needs cryptography (only in the venv)
+        run([tree / '.venv/bin/python', 'scripts/extract_app_icon.py', '--source-spec', icon_spec, '--output', 'build/AppIcon.icns'],
             logs / 'app_icon.log', cwd=tree, env=env)
     say('2/4 data and 4/4 binary: building the game binary, its tables and the launcher')
     step_binary(tree, None, None, {**env, 'SHADER_LIST': f'../{g["folder"].name}/assets/shader_list.tsv'}, logs, version=v)
@@ -2721,7 +2729,10 @@ def build_oot(args, source):
     spec = importlib.util.spec_from_file_location('oot_build', REPO / 'games/oot/build.py')
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    out, tree, expected, shader_chain = module.build(args, source)
+    try:
+        out, tree, expected, shader_chain = module.build(args, source)
+    except ValueError as e:   # the port's checks say what stopped it; the player reads it on the ERROR line (#2070)
+        raise BuildError(str(e)) from e
     record_ns2_device_build(tree, out, dict(version='oot', expected=expected, folder=REPO / 'games/oot',
                            executable='OcarinaOfTime', depth_mode='runtime-device-state',
                            shader_chain=shader_chain), args)

@@ -329,8 +329,9 @@ void runtime_fs_init(void) {
 }
 static int path_ok(const char *p) {return romfs_path_valid_relative(p);}
 static const char *rom_path(const char *path) {
+ static _Thread_local char norm[4096];   /* voice lines ask for Voice/Resource//Stream/...: separators collapse here */
  unsigned count=atomic_load_explicit(&rom_mount_count,memory_order_acquire);
- for(unsigned i=0;i<count;i++){const char *p=romfs_path_relative(rom_mount_names[i],path);if(p)return p;}
+ for(unsigned i=0;i<count;i++){const char *p=romfs_path_relative_collapsed(rom_mount_names[i],path,norm,sizeof norm);if(p)return p;}
  return NULL;
 }
 static uint64_t lower(const char *name) {uint64_t lo=0,hi=file_count;while(lo<hi){uint64_t m=lo+(hi-lo)/2;if(strcmp(entry_name(entry(m)),name)<0)lo=m+1;else hi=m;}return lo;}
@@ -401,8 +402,13 @@ void runtime_fs_probe(void) {
  /* Audio stream paths include an extra slash after the mount root. Verify
     actual resource lookup and bytes, while still rejecting path traversal. */
  {
-  const char *name="Sound/Resource/Stream/Dm_OP_0001.bwav";
-  char path[256];uint8_t expected[257],actual[257];uint64_t h,n;
+  /* A voice line of this game's own RomFS (the copied TotK name Dm_OP_0001.bwav is not in OoT's): the first of the sorted
+     index under Voice/Resource/Stream/, the folder the game asks for as Voice/Resource//Stream. */
+  static const char dir[]="Voice/Resource/Stream/";uint64_t first=lower(dir);
+  need(first<file_count&&!strncmp(entry_name(entry(first)),dir,sizeof dir-1)&&entry(first).size>=257,"a voice stream in the RomFS");
+  const char *name=entry_name(entry(first)),*leaf=name+sizeof dir-1;
+  char path[512];uint8_t expected[257],actual[257];uint64_t h,n;
+  need(strlen(name)<400,"voice stream name length");
   snprintf(path,sizeof path,"rom:/%s",name);
   need(!runtime_romfs_open(&h,path,1),"open normal audio path");
   need(!runtime_romfs_read(&n,h,0,expected,sizeof expected)&&n==sizeof expected,"read normal audio path");runtime_romfs_close(h);
@@ -412,7 +418,15 @@ void runtime_fs_probe(void) {
    need(!runtime_romfs_open(&h,path,1),"open normalized audio stream path");
    need(!runtime_romfs_read(&n,h,0,actual,sizeof actual)&&n==sizeof actual&&!memcmp(actual,expected,sizeof actual),"normalized audio stream bytes");runtime_romfs_close(h);
   }
-  need(runtime_romfs_open(&h,"rom://../Sound/Resource/Stream/Dm_OP_0001.bwav",1)!=0,"reject traversal after repeated root separator");
+  snprintf(path,sizeof path,"rom://../%s",name);
+  need(runtime_romfs_open(&h,path,1)!=0,"reject traversal after repeated root separator");
+  /* Voice stream requests join "Resource" and "Stream" with an extra slash (Voice/Resource//Stream). */
+  snprintf(path,sizeof path,"rom:/Voice/Resource//Stream/%s",leaf);
+  need(!runtime_romfs_open(&h,path,1),"open interior double-slash audio stream");
+  need(!runtime_romfs_read(&n,h,0,actual,sizeof actual)&&n==sizeof actual&&!memcmp(actual,expected,sizeof actual),"interior double-slash audio bytes");runtime_romfs_close(h);
+  snprintf(path,sizeof path,"rom:/Voice//../%s",name);
+  need(runtime_romfs_open(&h,path,1)!=0,"reject traversal after an interior double slash");
+  fprintf(stderr,"[oot-fs] probe: voice stream %s opens as Voice/Resource//Stream/... with the same bytes\n",leaf);
  }
  for(uint64_t i=0;i<file_count;i+=file_count/64){Entry e=entry(i);char p[4096];need(snprintf(p,sizeof(p),"rom:/%s",entry_name(e))<(int)sizeof(p),"probe path");uint64_t h=0,n=0;int64_t size;uint32_t ov=overlay_slot(i);uint64_t expected_size=ov?overlays[ov-1].size:e.size;need(!runtime_romfs_open(&h,p,1)&&!runtime_romfs_size(&size,h)&&(uint64_t)size==expected_size,"probe open/size");need(!runtime_romfs_read(&n,h,0,buffer,sizeof(buffer)),"probe partial read");for(uint64_t j=0;j<n;j++)sum=sum*131+buffer[j];need(!runtime_romfs_read(&n,h,size,buffer,1)&&n==0,"probe EOF");runtime_romfs_close(h);count++;}
  for(size_t k=0;k<noverlay;k++){char p[4096];need(snprintf(p,sizeof(p),"rom:/%s",overlays[k].name)<(int)sizeof(p),"probe overlay path");
