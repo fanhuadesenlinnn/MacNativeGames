@@ -63,6 +63,7 @@ static _Atomic uint64_t g_taa_last;     // game frame of the last edge smoothing
 #include "nvn_geometry.h"   // geometry stages as compute: the capture record (GEO_CAPTURE_WORDS) the shader loader reads, the assembly nvn_geometry_rt.inc uses
 #include "nvn_texture_plan.h"
 #include "fps_overlay.h"
+#include "fps_board.h"   /* the leaderboard's frame-rate record: game presents after the world started (present_now) */
 #include "nvn_cover.h"
 #include "totk_shader_scope.h"   // totk_shader_scope_contains: the warm-up scope (PR #84)
 #include "dmsh_chain.h"   // DMSH_CHAIN：本源码树期望的 B 着色器库翻译链版本 | DMSH_CHAIN: the translation chain version of the B shader library expected by this source tree
@@ -254,7 +255,11 @@ static uint64_t g_fence;                        // 已提交的最大栅栏值�
    with the frame, stay with the second replay; counter reports and resets run in both (commands of the same replay read
    what they write). */
 int g_eye_pass; static uint64_t g_eye_skip_fence; static _Atomic int g_stereo_replay;
-int mtl_stereo_replay(void) { return atomic_load(&g_stereo_replay) != 0; }
+/* TOTK_VR_STEREO=1 at start turns the stereo replay with the eye's projection on (as "flag stereo_replay 2" does later). */
+static void stereo_replay_init(void) {   // applied once the VR camera runs (the first submissions come before the headset is there)
+    static int want = -1, applied; if (want < 0) { const char *e = getenv("TOTK_VR_STEREO"); want = e && *e == '1' && !e[1]; }
+    if (want && !applied && vr_wants_camera()) { applied = 1; atomic_store(&g_stereo_replay, 2); MLOG("[vr] stereo replay on from the start (TOTK_VR_STEREO=1)"); } }
+int mtl_stereo_replay(void) { stereo_replay_init(); return atomic_load(&g_stereo_replay) != 0; }
 int mtl_stereo_project(void) { return atomic_load(&g_stereo_replay) == 2; }   // "flag stereo_replay 2": also the eye's projection (1: the same picture twice, a check of the replay alone)
 /* Each eye replay's picture: the last pass it drew into a texture the game presents (their serials are noted at every
    present, with the picture's rectangle), copied at the replay's end into one side of a side-by-side texture; after the
@@ -264,7 +269,122 @@ static uint64_t g_eye_presented[4]; static int g_eye_npresented, g_eye_crop[4], 
 static id<MTLTexture> g_eye_swap, g_eye_sbs; static float g_eye_view[12], g_eye_fov[2][4];
 static _Atomic uint64_t g_eye_pairs, g_eye_nopic;
 static void eye_note_pass(MTL4RenderPassDescriptor *pd);
-void mtl_eye_pass(int e) { g_eye_skip_fence = e == 2 ? g_fence : 0; g_eye_pass = e; if (e) { g_eye_swap = nil; g_eye_have[e - 1] = 0; } }   // 2: the first replay was committed just before (mtl_sub_commit: ++g_fence)
+static inline void args_dirty_all(void);
+/* Stereo replay: passes that do not depend on the eye are drawn once ("flag eye_share 0|1|2": off, judged and logged
+   only, their draws and clears left out of the right eye's replay). A segment is the commands from one SetRenderTargets
+   to the next; both replays walk the same recordings, so the n-th segment of the right replay is the n-th of the left
+   (its op's address is checked). Judged during the left replay, by what the segment really uses:
+   - dependent: a draw binds a uniform range that holds a matrix mtl_ucap_eye replaced for the eye; or it samples a
+     texture a dependent segment wrote in this submission; or it draws into such a texture;
+   - not to be left out although independent: a counter is reported after it (the CPU reads the right replay's count); a
+     target of it is cleared or copied into outside segments, read and then written again (a reader between two writers
+     must see the first), or shared with a segment that runs; its ops were hoisted, frozen or deferred.
+   Left out, the targets keep what the left replay drew: the same picture, as nothing eye-dependent went into it.
+   Not seen by this: buffers a compute dispatch writes from a replaced matrix and an independent draw reads. */
+enum { EYE_SEGS = 4096, EYE_MEMS = 2048, EYE_PATCHES = 1024 };
+/* A texture's identity here is its serial, not its pool memory: the game puts one pass's depth target where another
+   pass's was (a 64x64 probe depth at the 256x144 occluder depth's address, share-04), and each has its own Metal texture. */
+#define EKEY(t) ((const void *)(uintptr_t)((t)->serial << 12))
+/* A target's own part of a texture: its layer and level when the view names them (the shadow cascades are the layers of
+   one array, the probe's faces and levels of one cube): one cascade a shader made eye-dependent does not take the others. */
+static const void *ekey_part(const tex_t *t, const view_t *v, int has) {
+    uint64_t k = t->serial << 12;
+    if (has && v->set_layers) k |= (uint64_t)((v->min_layer & 0xff) + 1) << 4;
+    if (has && v->set_levels) k |= (uint64_t)((v->base_level & 0xf) + 1);
+    return (const void *)(uintptr_t)k;
+}
+typedef struct { const uint8_t *op; const void *tgt[9], *whole[9]; uint32_t work; uint8_t ntgt, dep, keep, skip; uint8_t why, why_st, why_reg; uint16_t w, h; uint64_t why_addr, why_size, why_at; } eye_seg;   // why: 1 a uniform with an eye matrix, 2 a sampled eye-dependent texture, 3 an eye-dependent target (diagnostic)
+typedef struct { const void *mem; uint8_t dirty, read, unsafe, run; int16_t by; } eye_mem;   // by: the segment that made it eye-dependent (diagnostic; -2 a copy)
+static eye_seg g_eseg[EYE_SEGS]; static int g_eseg_n, g_eseg_cur = -1, g_eseg_cnt0, g_eseg_r, g_eye_skip, g_eseg_bad;
+static eye_mem g_emem[EYE_MEMS]; static int g_emem_n;
+static uint64_t g_epatch[EYE_PATCHES]; static int g_epatch_n;
+static _Atomic int g_eye_share = 2;   /* on by default (user 2026-11-11: "默认打开"); "flag eye_share 0" turns it off */
+static uint64_t g_eshare_stat[6];   // submissions, segments, left out, draws and clears left out, order mismatches
+static eye_mem *emem_get(const void *mem, int add) {
+    if (!mem) return NULL;
+    unsigned i = (unsigned)((uintptr_t)mem * 2654435761u >> 16) & (EYE_MEMS - 1);
+    for (int t = 0; t < EYE_MEMS; t++, i = (i + 1) & (EYE_MEMS - 1)) {
+        if (g_emem[i].mem == mem) return &g_emem[i];
+        if (!g_emem[i].mem) { if (!add || g_emem_n >= EYE_MEMS / 2) { if (add) g_eseg_bad = 1; return NULL; } g_emem[i].mem = mem; g_emem_n++; return &g_emem[i]; }
+    }
+    return NULL;
+}
+static int g_eseg_why; static uint64_t g_eseg_why_a[3]; static int g_eseg_why_s[2];
+static void eseg_dep(void) {
+    if (g_eseg_cur < 0) return; eye_seg *g = &g_eseg[g_eseg_cur]; if (g->dep) return; g->dep = 1;
+    g->why = (uint8_t)g_eseg_why; g->why_addr = g_eseg_why_a[0]; g->why_size = g_eseg_why_a[1]; g->why_at = g_eseg_why_a[2]; g->why_st = (uint8_t)g_eseg_why_s[0]; g->why_reg = (uint8_t)g_eseg_why_s[1];
+    for (int i = 0; i < g->ntgt; i++) { eye_mem *m = emem_get(g->tgt[i], 1), *w = emem_get(g->whole[i], 1); if (m && !m->dirty) { m->dirty = 1; m->by = (int16_t)g_eseg_cur; } if (w && !w->dirty) { w->dirty = 1; w->by = (int16_t)g_eseg_cur; } }
+}
+static void eseg_keep(int why) { if (g_eseg_cur >= 0) g_eseg[g_eseg_cur].keep |= (uint8_t)why; }   // 1 a samples-passed report follows, 2 hoisted, 4 frozen / deferred
+static void eseg_reset(void) { g_eseg_n = 0; g_eseg_cur = -1; g_eseg_cnt0 = 0; g_eseg_bad = 0; g_eye_skip = 0; if (g_emem_n) { memset(g_emem, 0, sizeof g_emem); g_emem_n = 0; } }
+static void eseg_begin(const uint8_t *op, const p_set_rt *r) {
+    if (g_eye_pass == 2) {   // the right replay: the same segment as the left one's
+        const int n = g_eseg_r++;
+        if (n < g_eseg_n && g_eseg[n].op == op && !g_eseg_bad) g_eye_skip = g_eseg[n].skip && atomic_load(&g_eye_share) == 2;
+        else { if (!g_eseg_bad) g_eshare_stat[4]++; g_eseg_bad = 1; g_eye_skip = 0; }
+        return;
+    }
+    if (g_eseg_n >= EYE_SEGS) { g_eseg_bad = 1; g_eseg_cur = -1; return; }
+    eye_seg *g = &g_eseg[g_eseg_cur = g_eseg_n++]; memset(g, 0, sizeof *g); g->op = op;
+    for (int i = 0; i <= r->n && i <= 8; i++) { const tex_t *t = i < r->n ? r->color[i] : r->depth; if (t && t->serial && g->ntgt < 9) { g->whole[g->ntgt] = EKEY(t); g->tgt[g->ntgt++] = i < r->n ? ekey_part(t, &r->cview[i], r->has_cview[i]) : ekey_part(t, &r->dview, r->has_dview); if (!g->w) { g->w = (uint16_t)t->d.width; g->h = (uint16_t)t->d.height; } } }
+    int dirty = 0;
+    for (int i = 0; i < g->ntgt; i++) { eye_mem *m = emem_get(g->tgt[i], 1), *w = emem_get(g->whole[i], 1); if (!m || !w) continue;
+        if (w->read) m->unsafe = 1;   // sampled, then written again: the reader must see what was there
+        if (m->dirty) { dirty = 1; g_eseg_why_a[0] = (uint64_t)(uintptr_t)g->tgt[i]; g_eseg_why_a[1] = (uint64_t)i; g_eseg_why_a[2] = (uint64_t)(uint16_t)m->by; } }
+    if (dirty) { g_eseg_why = 3; eseg_dep(); }
+    args_dirty_all();   // a continued pass binds again, so this segment's own uniforms and textures are seen (encode_args)
+}
+static void eseg_ubo(uint64_t addr, uint64_t size, int st, int reg) {   // encode_args, the left replay: a bound uniform range
+    if (g_eseg_cur < 0 || g_eseg[g_eseg_cur].dep || !g_epatch_n) return;
+    int lo = 0, hi = g_epatch_n; while (lo < hi) { int m = (lo + hi) / 2; if (g_epatch[m] + 64 <= addr) lo = m + 1; else hi = m; }
+    if (lo < g_epatch_n && g_epatch[lo] < addr + size) { g_eseg_why = 1; g_eseg_why_a[0] = addr; g_eseg_why_a[1] = size; g_eseg_why_a[2] = g_epatch[lo] - addr; g_eseg_why_s[0] = st; g_eseg_why_s[1] = reg; eseg_dep(); }
+}
+static void eseg_tex(const void *mem) {   // encode_args, the left replay: a sampled texture
+    eye_mem *m = emem_get(mem, 1); if (!m) return;
+    m->read = 1; if (m->dirty) { g_eseg_why = 2; g_eseg_why_a[0] = (uint64_t)(uintptr_t)mem; eseg_dep(); }
+}
+static void eseg_write(const void *mem, int dirty) { eye_mem *m = emem_get(mem, 1); if (m) { m->unsafe = 1; if (dirty && !m->dirty) { m->dirty = 1; m->by = -2; } } }   // a clear or copy outside the segments' draws
+static void eseg_op(uint32_t op, const void *a) {   // the left replay, every op
+    switch (op) {
+        case OP_DRAW: case OP_DRAW_IDX: case OP_CLEAR_COLOR: case OP_CLEAR_DS: if (g_eseg_cur >= 0) g_eseg[g_eseg_cur].work++; break;
+        /* only the samples-passed count depends on what was drawn (timestamps and the others do not) */
+        case OP_RESET_COUNTER: { uint64_t t; memcpy(&t, a, 8); if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) g_eseg_cnt0 = g_eseg_n > 0 ? g_eseg_n - 1 : 0; break; }
+        case OP_REPORT_COUNTER: { uint64_t t; memcpy(&t, a, 8); if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) for (int i = g_eseg_cnt0; i < g_eseg_n; i++) g_eseg[i].keep |= 1; break; }
+        case OP_CLEAR_TEX: { const p_clear_tex *c = a; if (c->tex) eseg_write(EKEY(c->tex), 0); break; }
+        case OP_COPY_B2T: { const p_copy_b2t *c = a; if (c->tex) eseg_write(EKEY(c->tex), 0); break; }
+        case OP_COPY_T2T: { const p_copy_t2t *c = a; const eye_mem *sm = c->src && (uintptr_t)c->src > 0x10000 ? emem_get(EKEY((const tex_t *)c->src), 0) : NULL;
+            if (c->dst && (uintptr_t)c->dst > 0x10000) eseg_write(EKEY(c->dst), sm && sm->dirty); break; }
+        default: break;
+    }
+}
+static void eseg_finish(void) {   // between the replays: which segments the right replay leaves out
+    g_eseg_r = 0; g_eye_skip = 0; if (!g_eseg_n) return;
+    for (int i = 0; i < g_eseg_n; i++) g_eseg[i].skip = !g_eseg[i].dep && !g_eseg[i].keep && g_eseg[i].ntgt > 0;
+    for (int round = 0; round < 8; round++) {   // a target any running segment writes is written by all its segments
+        int changed = 0;
+        for (int i = 0; i < g_eseg_n; i++) { eye_seg *g = &g_eseg[i];
+            for (int k = 0; k < g->ntgt; k++) { eye_mem *m = emem_get(g->tgt[k], 0), *w = emem_get(g->whole[k], 0); if (!m || !w) { if (g->skip) { g->skip = 0; changed = 1; } continue; }
+                if (!g->skip && !m->run) { m->run = 1; changed = 1; }
+                if (!g->skip && g->tgt[k] == g->whole[k] && !w->run) { w->run = 1; changed = 1; }   // a pass on the whole texture runs: so do its parts' passes
+                if (g->skip && (m->run || m->dirty || m->unsafe || w->unsafe || (g->tgt[k] != g->whole[k] && w->run))) { g->skip = 0; changed = 1; } } }
+        if (!changed) break;
+    }
+    uint64_t left = 0, work = 0, all = 0; for (int i = 0; i < g_eseg_n; i++) { all += g_eseg[i].work; if (g_eseg[i].skip && g_eseg[i].work) { left++; work += g_eseg[i].work; } }
+    g_eshare_stat[0]++; g_eshare_stat[1] += (uint64_t)g_eseg_n; g_eshare_stat[2] += left; g_eshare_stat[3] += work;
+    static uint64_t said, allsum; allsum += all;
+    if (g_eshare_stat[0] == 1 || g_eshare_stat[0] >= said + 600) { said = g_eshare_stat[0];
+        uint64_t dep = 0, keep = 0; for (int i = 0; i < g_eseg_n; i++) { dep += g_eseg[i].dep; keep += !g_eseg[i].dep && !g_eseg[i].skip; }
+        MLOG("[vr] eye share (%s): %llu stereo submissions, a submission has %.1f segments of which %.1f are left out of the right eye (%.0f of %.0f draws and clears); this one: %d segments, %llu eye-dependent, %llu independent but kept, %llu left out with %llu of %llu draws and clears; order mismatches %llu",
+             atomic_load(&g_eye_share) == 2 ? "on" : "judged only", (unsigned long long)g_eshare_stat[0], (double)g_eshare_stat[1] / (double)g_eshare_stat[0], (double)g_eshare_stat[2] / (double)g_eshare_stat[0],
+             (double)g_eshare_stat[3] / (double)g_eshare_stat[0], (double)allsum / (double)g_eshare_stat[0], g_eseg_n, (unsigned long long)dep, (unsigned long long)keep, (unsigned long long)left, (unsigned long long)work, (unsigned long long)all, (unsigned long long)g_eshare_stat[4]);
+        static int listed; if (listed < 3) { listed++; for (int i = 0; i < g_eseg_n && i < 400; i++) if (g_eseg[i].work)
+            MLOG("[vr] eye share segment %d: %ux%u, %u draws and clears, why %d (stage %d reg %d; 1: uniform %#llx size %llu, eye matrix at byte %llu; 3: target memory, its index, the segment that made it eye-dependent), %s", i, g_eseg[i].w, g_eseg[i].h, g_eseg[i].work, g_eseg[i].why, g_eseg[i].why_st, g_eseg[i].why_reg,
+                 (unsigned long long)g_eseg[i].why_addr, (unsigned long long)g_eseg[i].why_size, (unsigned long long)g_eseg[i].why_at, g_eseg[i].dep ? "eye-dependent" : g_eseg[i].skip ? "left out" : g_eseg[i].keep == 1 ? "kept (a samples-passed report follows)" : g_eseg[i].keep == 2 ? "kept (hoisted)" : g_eseg[i].keep ? "kept (frozen / deferred, or several)" : "kept (its target is shared, read then written, or copied into)"); }
+    }
+}
+void mtl_eye_pass(int e) { g_eye_skip_fence = e == 2 ? g_fence : 0;
+    if (e == 1) eseg_reset(); else if (e == 2) { if (atomic_load(&g_eye_share)) eseg_finish(); else { g_eseg_n = 0; g_eseg_r = 0; } } else g_eye_skip = 0;
+    g_eye_pass = e; if (e) g_eye_swap = nil; }   // 2: the first replay was committed just before (mtl_sub_commit: ++g_fence)
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
 static uint64_t g_done;                         // 已完成的最大栅栏值（完成回调写） | Highest completed fence value (written by the completion callback)
@@ -1653,6 +1773,7 @@ void *mtl_sub_capture_ubos(const uint64_t *h, int n) {
     return c;
 }
 static void ucap_free(usnap_cap *c) { if (c) { free(c->r); free(c->off); ucap_bytes_put(c->bytes, c->cap); free(c); } }
+void mtl_ucap_free(void *c) { ucap_free(c); }   // hle_nvn.c: a copy made for an eye replay that does not happen
 /* Stereo replay (hle_nvn.c submit_exec): a replay consumes its capture (usnap_finish frees it), so the first replay
    takes a copy of the submission's capture and the second the capture itself. */
 void *mtl_ucap_dup(const void *basev) {
@@ -1694,6 +1815,7 @@ static _Atomic uint64_t g_eye_fix[6];   // submissions patched, matrices replace
 int mtl_ucap_eye(void *capv, int eye) {
     extern uint64_t runtime_vr_camera_block(void);
     usnap_cap *c = capv; vr_views hv; uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (eye == 0 || eye == 1) g_eye_have[eye] = 0;   // set again below once this replay has the eye's projection
     /* one address for both eyes of a submission: the game flips the scene's camera blocks at its next frame's start, and
        with the replay behind the game thread the second eye would look for the next frame's block (st-06: every right
        eye without a camera block) */
@@ -1729,7 +1851,7 @@ int mtl_ucap_eye(void *capv, int eye) {
         pat[2 * k + 1][i] = (float)src[k][(i % 4) * 4 + i / 4]; rep[2 * k + 1][i] = (float)dst[k][(i % 4) * 4 + i / 4];
     }
     for (int k = 0; k < 8; k++) { key[k] = 0; for (int i = 1; i < 16; i++) if (fabsf(pat[k][i]) > fabsf(pat[k][key[k]])) key[k] = i; }
-    int replaced = 0, ranges = 0; uint64_t bytes = 0;
+    int replaced = 0, ranges = 0; uint64_t bytes = 0; if (eye == 0) g_epatch_n = 0;
     for (int i = 0; i < c->n; i++) {
         const size_t nb = (size_t)(c->r[i].hi - c->r[i].lo); uint8_t *b = c->bytes + c->off[i];
         const size_t skew = (size_t)((4 - (c->r[i].lo & 3)) & 3);   // floats at 4-byte addresses
@@ -1742,13 +1864,16 @@ int mtl_ucap_eye(void *capv, int eye) {
                 if (!(fabsf(x - kv) <= tol)) continue;
                 float w[16]; memcpy(w, &f[o], sizeof w); int same = 1;
                 for (int j = 0; j < 16 && same; j++) if (!(fabsf(w[j] - pat[k][j]) <= 5e-4f * fmaxf(1, fabsf(pat[k][j])))) same = 0;
-                if (same) { memcpy(&f[o], rep[k], sizeof rep[k]); replaced++; here = 1; o += 15; }
+                if (same) { memcpy(&f[o], rep[k], sizeof rep[k]); replaced++; here = 1;
+                    if (eye == 0 && g_epatch_n < EYE_PATCHES) g_epatch[g_epatch_n++] = c->r[i].lo + skew + 4 * (uint64_t)o;   // where an eye matrix is (eseg_ubo)
+                    o += 15; }
             }
         }
         ranges += here;
     }
     memcpy(g_eye_view, cam, sizeof g_eye_view); g_eye_have[eye] = 1;
     memcpy(g_eye_fov[eye], rays, sizeof rays);   // the picture's rays: the game's frustum, the same for both eyes
+    if (eye == 0 && g_epatch_n > 1) { for (int x = 1; x < g_epatch_n; x++) { uint64_t v = g_epatch[x]; int y = x; while (y > 0 && g_epatch[y - 1] > v) { g_epatch[y] = g_epatch[y - 1]; y--; } g_epatch[y] = v; } }
     atomic_fetch_add(&g_eye_fix[0], 1); atomic_fetch_add(&g_eye_fix[1], (uint64_t)replaced); atomic_fetch_add(&g_eye_fix[3], clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0);
     atomic_fetch_add(&g_eye_fix[4], bytes); atomic_fetch_add(&g_eye_fix[5], (uint64_t)ranges);
     { static uint64_t said; const uint64_t n = atomic_load(&g_eye_fix[0]);
@@ -2988,6 +3113,7 @@ void dm_gfx_set_flag(const char *name, int v) {
     if (!strcmp(name, "shadow_index_check")) { atomic_store(&g_shadow_index_check, v != 0); MLOG("[flag] shadow_index_check = %d", v != 0); return; }
     if (!strcmp(name, "pkg_final_cache")) { atomic_store(&g_pkg_final_cache, v != 0); MLOG("[flag] pkg_final_cache = %d", v != 0); return; }
     if (!strcmp(name, "pend_arena_pin")) { atomic_store(&g_pend_arena_pin, v != 0); MLOG("[flag] pend_arena_pin = %d", v != 0); return; }
+    if (!strcmp(name, "eye_share")) { atomic_store(&g_eye_share, v < 0 ? 0 : v > 2 ? 2 : v); MLOG("[flag] eye_share = %d (0 off, 1 eye-independent passes judged and logged, 2 left out of the right eye's replay)", v); return; }
     if (!strcmp(name, "stereo_replay")) { atomic_store(&g_stereo_replay, v < 0 ? 0 : v > 2 ? 2 : v); MLOG("[flag] stereo_replay = %d (0 off, 1 each submission replayed once per eye, 2 with the eye's projection)", v); return; }
     if (!strncmp(name, "skipfs_", 7)) {
         const char *p = name + 7;
@@ -9553,7 +9679,7 @@ static void warm_filled(void) {
    while playing (14 -> 28 ms per frame, 30 -> 20 fps). The next start goes over the list again; rows already in the
    cache take a few ms each. TOTK_WARM_LIGHT=0 turns it off. */
 static _Atomic int g_world_on;   // set at the first world frame (hle_nvn.c, nvnQueuePresentTexture)
-void mtl_note_world(void) { atomic_store(&g_world_on, 1); }
+void mtl_note_world(void) { atomic_store(&g_world_on, 1); fps_board_start(); }
 static void warm_light(void) {
 #if TARGET_OS_IPHONE
     const char *e = getenv("TOTK_WARM_LIGHT"); if (e && !atoi(e)) return;
@@ -10611,6 +10737,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
         }
         if (b->kind == NVN_RB_CBUF) {
             const p_bind_buf *u = reg < 16 ? &S.ubo[nvn_stage][reg] : NULL;
+            if (g_eye_pass == 1 && g_eseg_n && u && u->addr) eseg_ubo(u->addr, u->size, nvn_stage, reg);   // stereo replay: does this segment use an eye matrix
             cbc_ent *ce = NULL; cbc_ctx cx; int ce_hit = 0;   // TOTK_CBUF_CACHE
             if (cbc && u && u->addr && !(nvn_stage == 0 && reg == 0 && (ui_mat_on() || g_vr_ui_ray_draw)) && !(g_vr_collapse_draw && nvn_stage == 0 && reg == 2)) {
                 cbc_ctx_now(&cx); ce = &g_cbc[cbc_slot(u->addr, u->size)];
@@ -10681,6 +10808,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             int tid = reg < 128 ? (int)(S.tex[nvn_stage][reg] & 0xfffff) : 0;
             void *tv = NULL; uint64_t trid = tid ? tex_fast_rid(tid, &tv) : 0; __unsafe_unretained id<MTLTexture> t = (__bridge id<MTLTexture>)tv;
             if (nvn_stage == 1 && reg == 0 && !strncmp(sh->key, "0ac9a54938974396", 16) && getenv("DM_NVN_FLASHHDR")) g_flash_hdr_source = t;
+            if (g_eye_pass == 1 && g_eseg_n && t && tid < g_ntreg) eseg_tex(EKEY(&g_treg[tid].t));   // stereo replay: what this segment samples
             if (t && tid < g_ntreg) use_rec("tex", (uint64_t)g_treg[tid].t.mem, g_treg[tid].t.L.size, tid, &g_treg[tid].t);
             if (t && passdump() && tid < g_ntreg) PD("R %llu st%d ser=%llu mem=%p sz=%llu", g_stat_pass, nvn_stage, g_treg[tid].t.serial, (void *)g_treg[tid].t.mem, (unsigned long long)g_treg[tid].t.L.size);
             if (t && tid < g_ntreg) tp_note_fs(sh->key, g_treg[tid].t.serial, &g_treg[tid].t);   // TOTK: DM_NVN_TEXPNG_FS
@@ -16335,6 +16463,15 @@ void mtl_exec(const uint8_t *p) {
         if (p == g_defer_pend) { for (int gi = 0; gi < 4; gi++) if (g_defer_slots[gi].active && g_defer_slots[gi].p_end_op == p) g_defer_slots[gi].in_p = 0; g_defer_pend = NULL; }
         sdx_seq(p);
         if (h.op == OP_SET_RT) rt_toggle_poll();
+        if (g_eye_pass && (g_eseg_n || g_eye_pass == 1) && atomic_load(&g_eye_share)) {   // stereo replay: eye-independent segments (eseg_*)
+            if (h.op == OP_SET_RT) eseg_begin(p, (const p_set_rt *)(const void *)(p + 8));
+            if (g_eye_pass == 1) { eseg_op(h.op, p + 8);
+                if (g_hoist_n) for (int hi = 0; hi < g_hoist_n; hi++) if (g_hoist_skip[hi] == p) { eseg_keep(2); break; }
+                if (g_frz_on || g_frz_state || g_dm_rt_ab == 1 || defer_has_active() || defer_has_in_p()) eseg_keep(4); }
+            else if (g_eye_skip && (h.op == OP_DRAW || h.op == OP_DRAW_IDX || h.op == OP_CLEAR_COLOR || h.op == OP_CLEAR_DS)) {
+                int taken = 0; if (g_hoist_n) for (int hi = 0; hi < g_hoist_n; hi++) if (g_hoist_skip[hi] == p) { taken = 1; break; }
+                if (!taken) { p += h.size; continue; } }
+        }
         if ((g_frz_on || g_frz_state || g_dm_rt_ab == 1) && frz_op(h.op, p + 8)) { p += h.size; continue; }
         if (trace) PD("o cmd=%p pass=%llu op=%u size=%u", p, g_stat_pass, (unsigned)h.op, (unsigned)h.size);
         if (g_cg_pending && !cg_op_safe(h.op)) { g_cg.reason[1]++; cg_flush(); }   // TOTK: cube-face-set groups pend only across state / binding ops (nvn_cube_group.h)
@@ -16906,6 +17043,16 @@ int front_display_link_hz(void);   /* runtime/frontend_ios.m */
    the main display) is what builds without the Mac frontend link, such as probes; frontend.m's definition replaces it. */
 __attribute__((weak)) int front_display_hz(void) { return 0; }
 #endif
+/* The leaderboard's picture settings (runtime/board_upload.h): the resolutions and MetalFX upscale as the FPS box shows
+   them now (fps_overlay's draw below); 0 for a size not known yet. */
+void mtl_board_view(int *out_w, int *out_h, int *scene_w, int *scene_h, int *metalfx) {
+    uint64_t cur = atomic_load(&g_cur_frame), mfx_at = atomic_load(&g_mfxup_last), up_at = atomic_load(&g_outup_last), up = atomic_load(&g_outup_wh);
+    int ow = (int)atomic_load(&g_out_w), oh = (int)atomic_load(&g_out_h);
+    if (up_at && cur - up_at < 30 && up) { ow = (int)(uint32_t)up; oh = (int)(up >> 32); }
+    *out_w = ow; *out_h = oh;
+    *scene_w = (int)atomic_load(&g_scene_w); *scene_h = (int)atomic_load(&g_scene_h);
+    *metalfx = mfx_at && cur - mfx_at < 30;
+}
 int mtl_display_hz(void) {
     if (!front_metal_layer()) return 0;
 #if TARGET_OS_OSX
@@ -17510,8 +17657,8 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     /* TOTK: the FPS box counts game presents per second and, while MetalFX interpolates, the generated frames shown as
        well ("FPS 50+50"): the user found the plain displayed count misleading on the phone ("the number looks good, it
        feels slow"), so both are shown. */
-    if (interp >= 0) { fps_overlay_note_gen(++g_gen_shown, CACurrentMediaTime()); atomic_store(&g_mfxi_last, frame ? frame : 1); }
-    else fps_overlay_note(ticket, CACurrentMediaTime());
+    if (interp >= 0) { double now = CACurrentMediaTime(); fps_overlay_note_gen(++g_gen_shown, now); fps_board_note_gen(now); atomic_store(&g_mfxi_last, frame ? frame : 1); }
+    else { double now = CACurrentMediaTime(); fps_overlay_note(ticket, now); fps_board_note(ticket, now); }
     if (g_use != USE_OFF && g_use != USE_DONE) use_tick();
     if (bootprof() && (g_present_n == 1 || g_present_n % 120 == 0)) {
         if (g_present_n == 1) g_bp_first_present = bp_now() - g_bp_t0;
