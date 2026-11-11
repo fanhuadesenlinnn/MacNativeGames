@@ -89,6 +89,7 @@ static _Atomic uint64_t g_taa_last;     // game frame of the last edge smoothing
 #include "nvn_geometry.h"   // geometry stages as compute: the capture record (GEO_CAPTURE_WORDS) the shader loader reads, the assembly nvn_geometry_rt.inc uses
 #include "nvn_texture_plan.h"
 #include "fps_overlay.h"
+#include "fps_board.h"   /* the leaderboard's frame-rate record: game presents after the world started (present_now) */
 #include "nvn_cover.h"
 #include "totk_shader_scope.h"   // totk_shader_scope_contains: the warm-up scope (PR #84)
 #include "dmsh_chain.h"   // DMSH_CHAIN：本源码树期望的 B 着色器库翻译链版本 | DMSH_CHAIN: the translation chain version of the B shader library expected by this source tree
@@ -9416,6 +9417,7 @@ static id<MTLRenderPipelineState> pso_new(MTLRenderPipelineDescriptor *d, NSStri
         par_pre_note(ps != nil);
         if (ps) { par_count(1); return ps; }
         par_miss_note("miss", key, d);
+        par_stale(key);
     } else par_miss_note(atomic_load(&par_filling) ? "fill" : "nofile", key, d);
     if (key && g_par_on) par_count(0);
     ps = [g_dev newRenderPipelineStateWithDescriptor:d error:e];
@@ -9436,6 +9438,7 @@ static id<MTLComputePipelineState> cs_new_(NvShader *cs, MTLComputePipelineDescr
         par_pre_note(ps != nil);
         if (ps) { atomic_fetch_add(par_last_pre?&g_compute_bundle_hits:&g_compute_device_hits,1); par_count(1); return ps; }
         d.binaryArchives = nil;
+        par_stale(key);
     }
     atomic_fetch_add(&g_compute_misses,1);
     if (g_par_on) par_count(0);
@@ -10339,7 +10342,7 @@ static int par_row_have(const pso_skey *sk, int vborder, int fz, NSString *varia
     NSMutableData *b = [NSMutableData dataWithBytes:&ak length:sizeof ak]; [b appendData:[variant dataUsingEncoding:NSUTF8StringEncoding]];
     NSString *key = par_hash(b.bytes, b.length);
     pthread_mutex_lock(&g_par_mu); BOOL have = [g_par_have containsObject:key]; pthread_mutex_unlock(&g_par_mu);
-    return have;
+    return have && !g_par_recheck;   // packaging makes it against the archive (g_par_recheck)
 }
 /* A B row (pso_adopt): the pipeline with its border variants, built from the recipe instead of bound samplers.
    keep 0 (warm_fill_archive): built into the pipeline archive and dropped; 2 when the archive has it already. */
@@ -10613,7 +10616,7 @@ static void warm_filled(void) {
    while playing (14 -> 28 ms per frame, 30 -> 20 fps). The next start goes over the list again; rows already in the
    cache take a few ms each. TOTK_WARM_LIGHT=0 turns it off. */
 static _Atomic int g_world_on;   // set at the first world frame (hle_nvn.c, nvnQueuePresentTexture)
-void mtl_note_world(void) { atomic_store(&g_world_on, 1); }
+void mtl_note_world(void) { atomic_store(&g_world_on, 1); fps_board_start(); }
 static void warm_light(void) {
 #if TARGET_OS_IPHONE
     const char *e = getenv("TOTK_WARM_LIGHT"); if (e && !atoi(e)) return;
@@ -10672,7 +10675,7 @@ static void fill_row(NSString *line, NSMutableDictionary<NSString *, NvShader *>
            state description); a start then reads the list without loading a shader */
         pso_skey ak = sk; memset(&ak.fz_desc, 0, sizeof ak.fz_desc);
         pthread_mutex_lock(&g_par_mu); BOOL have = [g_par_have containsObject:par_hash(&ak, sizeof ak)]; pthread_mutex_unlock(&g_par_mu);
-        if (have) { atomic_fetch_add(&fc->nhave, 1); return; }
+        if (have && !g_par_recheck) { atomic_fetch_add(&fc->nhave, 1); return; }   // packaging makes it against the archive
         NSString *vkey = warm_key(sk.vs, sizeof sk.vs), *fkey = warm_key(sk.fs, sizeof sk.fs);
         NvShader *vs = vkey.length ? warm_shader(dict, vkey, sk.vs_stage) : nil, *fs = fkey.length ? warm_shader(dict, fkey, sk.fs_stage) : nil;
         if (!vs || (fkey.length && !fs)) { atomic_fetch_add(&fc->nfail, 1); return; }
@@ -10682,7 +10685,7 @@ static void fill_row(NSString *line, NSMutableDictionary<NSString *, NvShader *>
     } else if ([c[0] isEqualToString:@"C"] && c.count >= 2 && [c[1] length]) {
         const char *ck = c[1].UTF8String;
         pthread_mutex_lock(&g_par_mu); BOOL have = [g_par_have containsObject:[@"c" stringByAppendingString:par_hash(ck, strlen(ck))]]; pthread_mutex_unlock(&g_par_mu);
-        if (have) { atomic_fetch_add(&fc->nhave, 1); return; }
+        if (have && !g_par_recheck) { atomic_fetch_add(&fc->nhave, 1); return; }
         NvShader *cs = warm_shader(dict, c[1], 5); if (!cs) { atomic_fetch_add(&fc->nfail, 1); return; }
         NSError *er = nil; ps = cs_new(cs, &er);
         if (ps) atomic_fetch_add(&fc->nc, 1);
@@ -10797,8 +10800,15 @@ int mtl_pipeline_archive_tool(int argc, char **argv) {
         if (![NSFileManager.defaultManager isReadableFileAtPath:@(argv[i])]) MDIE("pipeline-archive: cannot read %s", argv[i]);
         [lists addObject:@(argv[i])];
     }
+    const char *recheck = getenv("TOTK_PAR_RECHECK");
+    g_par_recheck = recheck && !strcmp(recheck, "1");
     dispatch_semaphore_t done = dispatch_semaphore_create(0);
     warm_fill_archive(lists, done); dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
+    if (g_par_recheck) {
+        NSUInteger pruned = par_prune_superseded();
+        MLOG("管线存档：按这个运行时核对，%llu 条和存档里的不一样，重新编进新文件；删掉被完全取代的旧文件 %lu 个",
+             (unsigned long long)atomic_load(&g_par_stale), (unsigned long)pruned);
+    }
     printf("{\"render\": %llu, \"compute\": %llu, \"mesh\": %llu, \"kept\": %llu, \"failed\": %llu, \"seconds\": %.1f, \"write_failed\": %llu, \"arch\": \"%s\"}\n",
            g_fill_last.render, g_fill_last.compute, g_fill_last.mesh, g_fill_last.have, g_fill_last.failed, g_fill_last.seconds, (unsigned long long)atomic_load(&g_par_write_failed),
            g_dev.architecture.name.UTF8String ?: "");
@@ -10911,17 +10921,9 @@ static void warm_start(void) {
        own list, the rest behind it (before 2026-10-23). */
     const char *bt = getenv("TOTK_WARM_BEFORE_TITLE");
     int before = !(bt && !atoi(bt));
-#if !TARGET_OS_IPHONE
-    /* Mac with a valid archive (user 2026-10-29: "桌面 王国 每次打开 都预热"): nothing is left to compile or save, the wait
-       only read 19,908 libraries and 30,642 pipelines back from disk, 16.7-18.6 s before the title on every start. The
-       title comes now and that goes on behind the menu; the first world frame still waits for all of it (hle_nvn.c,
-       mtl_warm_wait without a limit on the Mac), so play starts with every listed pipeline ready, as before.
-       TOTK_WARM_BEFORE_TITLE=1: wait before the title anyway. */
-    if (!bt && g_par_valid && !g_par_fill_lists && !g_shared_fill) {
-        before = 0;
-        MLOG("预热：管线存档齐全，标题不等预热读完，剩下的在菜单后面读，进世界前等它做完");
-    }
-#endif
+    /* Ocarina of Time waits before the title on the Mac too, archive complete or not (user 2026-11-11: "改回去 必须在 标题前
+       预热", for every game: "所有游戏都是"). From 2026-10-29 the Mac skipped the wait when the archive was complete and read it behind the menu; with the
+       merged list (17,620 pipelines) the title then stood for 67-83 s while the warm-up still ran. */
     if (before) {
         uint64_t t1 = bp_now();
         while (atomic_load(&g_warm_running)) usleep(5000);
@@ -17719,7 +17721,7 @@ static void copy_b2t(const p_copy_b2t *c) {
     { static long on = -1; static int left = 24; if (on < 0) { const char *e = getenv("TOTK_T2T_LOG"); on = e ? atol(e) : 0; if (e && !on) on = 1; }   // with TOTK_T2T_LOG: buffer <-> texture copies too
       if (on > 0 && (long)atomic_load(&g_cur_frame) >= on && left > 0 && c->tex) { left--;
           MLOG("[%s] f%llu tex ser=%llu %ux%u fmt=%#x mem=%p buf=%#llx", "b2t", (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)c->tex->serial, c->tex->d.width, c->tex->d.height, c->tex->d.format, (void *)c->tex->mem, (unsigned long long)c->src); } }
-    if (c->tex) zskip_del(c->tex->serial);
+    if (c->tex) { zskip_del(c->tex->serial); netbp_note_upload(c->tex->serial); }   // OOT: a movie's decoded planes (oot_movie_bypass.h)
     id<MTLTexture> t = tex_mtl(c->tex);
     PD("C ser=%llu", c->tex->serial);
     if (!t) return;
@@ -18802,6 +18804,16 @@ int front_display_link_hz(void);   /* runtime/frontend_ios.m */
    the main display) is what builds without the Mac frontend link, such as probes; frontend.m's definition replaces it. */
 __attribute__((weak)) int front_display_hz(void) { return 0; }
 #endif
+/* The leaderboard's picture settings (runtime/board_upload.h): the resolutions and MetalFX upscale as the FPS box shows
+   them now (fps_overlay's draw below); 0 for a size not known yet. */
+void mtl_board_view(int *out_w, int *out_h, int *scene_w, int *scene_h, int *metalfx) {
+    uint64_t cur = atomic_load(&g_cur_frame), mfx_at = atomic_load(&g_mfxup_last), up_at = atomic_load(&g_outup_last), up = atomic_load(&g_outup_wh);
+    int ow = (int)atomic_load(&g_out_w), oh = (int)atomic_load(&g_out_h);
+    if (up_at && cur - up_at < 30 && up) { ow = (int)(uint32_t)up; oh = (int)(up >> 32); }
+    *out_w = ow; *out_h = oh;
+    *scene_w = (int)atomic_load(&g_scene_w); *scene_h = (int)atomic_load(&g_scene_h);
+    *metalfx = mfx_at && cur - mfx_at < 30;
+}
 int mtl_display_hz(void) {
     if (!front_metal_layer()) return 0;
 #if TARGET_OS_OSX
@@ -19406,8 +19418,8 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     /* TOTK: the FPS box counts game presents per second and, while MetalFX interpolates, the generated frames shown as
        well ("FPS 50+50"): the user found the plain displayed count misleading on the phone ("the number looks good, it
        feels slow"), so both are shown. */
-    if (interp >= 0) { fps_overlay_note_gen(++g_gen_shown, CACurrentMediaTime()); atomic_store(&g_mfxi_last, frame ? frame : 1); }
-    else fps_overlay_note(ticket, CACurrentMediaTime());
+    if (interp >= 0) { double now = CACurrentMediaTime(); fps_overlay_note_gen(++g_gen_shown, now); fps_board_note_gen(now); atomic_store(&g_mfxi_last, frame ? frame : 1); }
+    else { double now = CACurrentMediaTime(); fps_overlay_note(ticket, now); fps_board_note(ticket, now); }
     if (g_use != USE_OFF && g_use != USE_DONE) use_tick();
     if (bootprof() && (g_present_n == 1 || g_present_n % 120 == 0)) {
         if (g_present_n == 1) g_bp_first_present = bp_now() - g_bp_t0;
@@ -22899,5 +22911,15 @@ void runtime_shader_seed(const char *path, const char *list) { @autoreleasepool 
             else if (shown++ < 8) MLOG("[seed] [RED] shader %s: its listed bind state %lu was not translated (see above)", ((NSString *)j[0]).UTF8String, [j[2] unsignedLongValue]);
         }
         MLOG("[seed] the shader list's bind states: %u of %u translated (%lu shaders of the list are in the corpus)", lok, asked, (unsigned long)listed_shaders.count);
+    }
+    /* The seed is what this run checked or made (prepare_ns2_seed.py reads the file): a cached translation this runtime would
+       ask for differently was made again (totk_shader_rt.m seed_verified), and one no request of this run reached stays out. */
+    const char *vout = getenv("TOTK_SEED_VERIFIED_OUT");
+    if (vout && *vout) {
+        uint64_t kept = 0, dropped = 0; NSArray<NSString *> *v = totk_rt_seed_verified(&kept, &dropped);
+        NSString *text = v.count ? [[v componentsJoinedByString:@"\n"] stringByAppendingString:@"\n"] : @"";
+        if (![text writeToFile:@(vout) atomically:YES encoding:NSUTF8StringEncoding error:nil]) MDIE("seed-shaders: cannot write %s", vout);
+        MLOG("[seed] requests checked: %lu variants for this runtime, %llu cached ones kept, %llu made again", (unsigned long)v.count,
+             (unsigned long long)kept, (unsigned long long)dropped);
     }
 }}

@@ -1894,6 +1894,31 @@ def record_update_source(info, work):
     info['MNGBuildPython'] = sys.executable
 
 
+def recorded_work_folder(app, name):
+    """The work folder of an update run without --work, and why: the one the app records (record_update_source), so the
+    update reuses the files of the build that made the app. Only an app that records none (built before 31 October 2026)
+    falls back to <name> next to the app. A recorded folder that was deleted is made again where it was: an app that
+    carries its game data needs none of its old files, and one that does says so later (game_data). A recorded folder
+    whose parent is gone too (a disk not connected, a volume deleted) is an error naming both ways out, never a new
+    folder next to the app. 2026-11-11: the fallback was the only default, and an update of an app built with --work
+    made a second 2.2 GB work folder in the folder that holds the apps, which the updated app then recorded."""
+    app = Path(app)
+    try:
+        recorded = plistlib.loads((app / 'Contents/Info.plist').read_bytes()).get('MNGWorkFolder')
+    except (OSError, ValueError, plistlib.InvalidFileException, AttributeError):
+        recorded = None
+    fallback = app.parent / name
+    if isinstance(recorded, str) and recorded:
+        if Path(recorded).is_dir():
+            return Path(recorded).resolve(), 'recorded by the app'
+        if Path(recorded).parent.is_dir():
+            return Path(recorded), 'recorded by the app; it was deleted, so it is made again there'
+        raise BuildError(f'the work folder {app.name} records, {recorded}, cannot be found, nor the folder it was in (a disk '
+                         f'that is not connected, or a folder moved or deleted): connect that disk and run the same command '
+                         f'again, or pass --work <a folder of your choice> (docs/install.md, Folders); the app then records it')
+    return fallback, f'the app records no work folder; using {name} next to the app'
+
+
 def source_commit():
     """The short hash of the commit this checkout is on (user 2026-10-25: the HUD shows it, to tell which commit an app
     was built from; uncommitted changes are not shown), or '' outside a git checkout."""
@@ -2014,8 +2039,11 @@ def mac_pipelines(tree, res, version, logs):
     """The Mac's pipeline archive, made while packaging (user 2026-10-29: "mac的 管线 预热 和iPhone 一样 放在打包阶段做 不在app里做了"):
     the game binary's pipeline-archive mode (TOTK_PIPELINE_ARCHIVE_HOST=1) makes every pipeline of the warm-up lists from
     the libraries the game itself loads (the app's shader-libs) on this Mac's GPU, so the first start takes them from the
-    app instead of filling its archive before the title (par_load_prebuilt). They are kept in build/mac-pipelines/<version>
-    and made again only when the lists, the seed or the game binary changed. The tool runs from the app's build folder
+    app instead of filling its archive before the title (par_load_prebuilt). They are kept in build/mac-pipelines/<version>;
+    when the lists, the seed or the game binary changed, every listed pipeline is made against them (TOTK_PAR_RECHECK=1:
+    Metal compares the functions and state), so only the ones described otherwise now are compiled and written again
+    (nvn_mtl.m mtl_pipeline_archive_tool, par_stale; user 2026-11-11: "如何让 快速更新 不要这么容易失效"). Until then any
+    such change threw them all away. The tool runs from the app's build folder
     (where the game finds shader-libs and the seed) under its own name: the game lock takes any totk-native* process for
     a game (runtime/game_slot.c pid_is_game). On another Mac's GPU the files are not used and that Mac fills its own, as
     before; nothing here can make the build fail."""
@@ -2031,19 +2059,19 @@ def mac_pipelines(tree, res, version, logs):
     stamp = work / 'inputs.txt'
     was = stamp.read_text().split() if stamp.is_file() else []
     kept = was == [want]
-    if was[:1] != [want]:
-        shutil.rmtree(work, ignore_errors=True)   # pipelines of other shaders, lists or binary; a partial run is completed
+    recheck = was[:1] != [want]   # other shaders, lists or binary: checked against the archive, not thrown away
     work.mkdir(parents=True, exist_ok=True)
     tool = build / 'mac-pipeline-archive'
     tool.unlink(missing_ok=True)   # left by an interrupted build (a link since 2026-11-03, a copy before)
     say("4/4 app: making the pipeline archive for this Mac's GPU, so the first start needs no warm-up before the title"
-        + (' (kept from the last build)' if kept else ' (a few minutes the first time)'))
+        + (' (kept from the last build)' if kept else ' (checking the last build\'s against this one)' if (work / 'cache/pipelines').is_dir()
+           else ' (a few minutes the first time)'))
     t0 = time.time()
     try:
         with run_outside_bundle(build / 'totk-native', tool, tree / 'build/outside-bundle') as program:
             run([program, f'rewritten/{version}', 'pipeline-archive', *lists], logs / 'mac-pipelines.log', cwd=res,
                 env=dict(os.environ, TOTK_SHADER_CACHE=str(work / 'cache'), TOTK_SHADER_SEED_DIR=str(seed),
-                         TOTK_PIPELINE_ARCHIVE_HOST='1', TOTK_DEBUG_LOG='1'))
+                         TOTK_PIPELINE_ARCHIVE_HOST='1', TOTK_DEBUG_LOG='1', TOTK_PAR_RECHECK='1' if recheck else '0'))
     except (BuildError, OSError) as e:
         report = last_json(logs / 'mac-pipelines.log') or {}
         if not report.get('write_failed') or not report.get('render'):
@@ -2304,7 +2332,7 @@ def main_ns2(args, dump):
     out = args.out.expanduser().resolve() if args.out else dump.parent / f'{app_name}.app'
     work = args.work.expanduser().resolve() if args.work else dump.parent / f'{executable}_build'
     if out.suffix.lower() not in (('.app', '.ipa') if device_app else ('.app',)):
-        raise BuildError(f'the output must end in .app' + (' or .ipa' if device_app else '') + f': {out}')
+        raise BuildError('the output must end in .app' + (' or .ipa' if device_app else '') + f': {out}')
     shared_fonts = args.shared_fonts.expanduser().resolve() if args.shared_fonts else None
     py = prerequisites(args)
     logs = work / 'logs'
@@ -2694,7 +2722,7 @@ def parse_args(argv):
                          'on another disk; the app remembers the folder, and the launcher falls back to the default one '
                          '(on another Mac, say) when FOLDER has no complete image')
     ap.add_argument('-k', '--keys', type=Path, help='your prod.keys (an XCI or NSP; a Switch 2 dump folder needs none)')
-    ap.add_argument('-o', '--out', type=Path, help=f'the app or IPA to write (default depends on --platform; next to the game file)')
+    ap.add_argument('-o', '--out', type=Path, help='the app or IPA to write (default depends on --platform; next to the game file)')
     ap.add_argument('--work', type=Path, help='work folder (default: TOTK_build next to the game file)')
     ap.add_argument('--mod', type=Path, metavar='FOLDER',
                     help='a mod folder prepared before the build: its exefs/ IPS / IPS32 / pchtxt patches for the main '
