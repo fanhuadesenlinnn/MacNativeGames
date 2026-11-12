@@ -99,18 +99,21 @@
    controls.txt). Click a box, then press a key or a mouse button (key 1 cancels; Command keys stay the system's) or, in
    the controller column, a controller button; with a controller, pick a row and press A, then the new button. An input
    another action holds swaps places with this box's. Right-click clears a box. Two buttons reset the keyboard and mouse,
-   or the controller, to the default (the file removed). A capture ends after 6 seconds without input.
+   or the controller, to the default (the file removed). A capture ends after 6 seconds without input. The last row is the
+   screenshot (user 2026-11-11): P by default, and on a controller a button held 3 s (the touchpad by default).
    Update (PR #1404; user 2026-10-31): the version, and that it is the newest or each newer commit's message; an Update
    button that closes the game, updates the app from its checkout and opens it again, or why it cannot and how to update
    the code and build again by hand (update_tab.h, app/auto_update.h).
    着色器贡献 (user 2026-11-10, contrib_tab.h): how many shaders were contributed and how many new ones were found, and one
-   big switch, "Contribute shaders automatically", the start-up question's choice (totk_contrib_upload.h). On the display
-   page, at the right of the bottom line, a button stars the project (its GitHub page); its note shows for a few seconds
-   where the version is.
+   big switch, "Contribute shaders automatically", the start-up question's choice (totk_contrib_upload.h). At the right of every page's bottom line, 访问主页 (user 2026-11-11, was the display page's star) opens the site
+   with the player's codes (settings_home_url); its note shows for a few seconds where the version is.
    排行榜 (user 2026-11-11, board_tab.h): the latest frame-rate board of this game, and the switch "我要上榜", off by
    default and never asked; on, the play's frame numbers are sent and the player's own row is green (board_upload.h).
    截图分享 (user 2026-11-11, shot_tab.h): the game's shared screenshots, and the switch "分享我的截图", off by default and
    never asked; on, every saved screenshot is shared (shot_upload.h); the player's own are marked green and can be deleted.
+   Its 截屏 button takes a screenshot as the capture button does: the game's next frame, without the panel.
+   Both pages have the player's nickname (user 2026-11-11, nick_row.h): shown on the board and the screenshots instead of
+   the anonymous code, typed in the game's text bar after 修改, and an empty one clears it; it turns on no upload switch.
    A setting this game or start cannot change shows its one value, greyed out. While the panel is open the game gets no
    keyboard, mouse or controller input (TOTKInputView, front_mouse_update and gamepad capture). The controls read their
    values again twice a second, so they always show what is in force. */
@@ -822,19 +825,9 @@ static void settings_footer_note(NSString *text, BOOL bad);
 /* Where the capture button's pictures go (runtime/screenshot.h): a folder. The row opens the system's own folder chooser
    (the panel the launcher opens for its game data), not a text field, and the chosen folder is checked before it is kept
    (screenshot_problem), so a read-only disk or another account's folder is refused here with its reason instead of failing
-   at the next capture. The choice is saved next to controls.txt (runtime_setting_save), not in the working folder. An
-   iPhone and an iPad have no panel here: their pictures go into the photo library, in the album named after the game. */
-static void settings_choose_screenshot_folder(void);
-static TOTKSettingRow *settings_screenshot_row(void) {
- TOTKSettingRow *r=[TOTKSettingRow new];
- char folder[PATH_MAX];screenshot_directory(folder,sizeof folder);
- NSString *shown=@(folder);   /* kept as the object the block captures: an array cannot cross into one */
- r.title=settings_text("截图保存目录","Screenshot folder");
- r.choices=@[shown];   /* shown by the button, refreshed when the choice changes */
- r.get=^int{char now[PATH_MAX];screenshot_directory(now,sizeof now);return (int)strcmp(now,shown.UTF8String);};
- r.set=^(int v){(void)v;settings_choose_screenshot_folder();};
- return r;
-}
+   at the next capture. The choice is saved next to controls.txt (runtime_setting_save), not in the working folder. The
+   截图分享 page shows the folder and calls this (user 2026-11-11: moved there from the input page). An iPhone and an
+   iPad have no panel here: their pictures go into the photo library, in the album named after the game. */
 static void settings_choose_screenshot_folder(void) {
  char now[PATH_MAX];screenshot_directory(now,sizeof now);
  NSOpenPanel *panel=[NSOpenPanel openPanel];
@@ -948,8 +941,6 @@ static NSArray<TOTKSettingRow *> *settings_rows(void) {
  [rows addObject:settings_feedback_row(0)];
  [rows addObject:settings_gain_row()];
  [rows addObject:settings_feedback_row(1)];
- /* The capture button's pictures (runtime/screenshot.h): a folder here, the photo library on a phone. */
- [rows addObject:settings_screenshot_row()];
  NSUInteger input=rows.count;
  /* User (runtime/users.h, docs/users.md): the user this run opened with, and the one the next launch gets — the save
     area is named after the user's id, so another user plays on their own saves. A running game keeps its user. */
@@ -990,7 +981,10 @@ static NSArray<TOTKSettingRow *> *settings_rows(void) {
 /* The game actions in the order the page lists them; action -1 starts a section. */
 typedef struct { int action; const char *zh, *en, *tag; } SettingsAction;
 /* The key bindings' row for the settings panel itself: key 1 on the keyboard (fixed), on a controller L3 + R3 together or
-   the button picked (gamepad.m runtime_gamepad_settings_button, user 2026-10-29). */
+   the button picked (gamepad.m runtime_gamepad_settings_button, user 2026-10-29). The screenshot row after it (user
+   2026-11-11): two keyboard and mouse inputs as any action (keyboard_map.h KEYMAP_SCREENSHOT, P by default), and the
+   controller button held 3 s (gamepad.m runtime_gamepad_screenshot_button, the touchpad by default), which keeps what
+   else it drives. */
 enum { SETTINGS_BIND_PANEL = 100 };
 static const SettingsAction *settings_actions(int *count) {
  static const SettingsAction list[]={
@@ -1021,8 +1015,9 @@ static const SettingsAction *settings_actions(int *count) {
   {-1,"十字键","D-pad",NULL},
   {KEYMAP_DUP,"十字键 上","D-pad up","↑"},{KEYMAP_DDOWN,"十字键 下","D-pad down","↓"},
   {KEYMAP_DLEFT,"十字键 左","D-pad left","←"},{KEYMAP_DRIGHT,"十字键 右","D-pad right","→"},
-  {-1,"设置","Settings",NULL},
-  {SETTINGS_BIND_PANEL,"打开 / 关闭设置面板","Open / close this panel",NULL}};
+  {-1,"设置和截图","Settings & screenshots",NULL},
+  {SETTINGS_BIND_PANEL,"打开 / 关闭设置面板","Open / close this panel",NULL},
+  {KEYMAP_SCREENSHOT,"截图","Screenshot",NULL}};
  *count=(int)(sizeof list/sizeof *list);
  return list;
 }
@@ -1057,8 +1052,15 @@ static NSString *settings_panel_pad_text(int family) {
  if(b>=0)return settings_pad_button(b,family);
  return [NSString stringWithFormat:@"%@ + %@",settings_pad_button(4,family),settings_pad_button(5,family)];
 }
+/* The controller's screenshot button, as the key bindings show it: the button and how long it is held, or none. */
+static NSString *settings_shot_pad_text(int family) {
+ int b=runtime_gamepad_screenshot_button();
+ if(b<0)return @"—";
+ return [NSString stringWithFormat:@(TOTK_UI("%@ 长按 %d 秒","%@ held %d s")),settings_pad_button(b,family),CONTROLLER_SCREENSHOT_HOLD_MS/1000];
+}
 static NSString *settings_pad_text(int action, const uint16_t *map, int family) {
- if(action>=KEYMAP_MOVE_UP){static const char *const arrows[]={"↑","↓","←","→"};int camera=action>=KEYMAP_CAMERA_UP;
+ if(action==KEYMAP_SCREENSHOT)return settings_shot_pad_text(family);
+ if(action>=KEYMAP_MOVE_UP&&action<=KEYMAP_CAMERA_RIGHT){static const char *const arrows[]={"↑","↓","←","→"};int camera=action>=KEYMAP_CAMERA_UP;
   return [NSString stringWithFormat:@"%@ %@",camera?settings_text("右摇杆","Right stick"):settings_text("左摇杆","Left stick"),@(arrows[(action-KEYMAP_MOVE_UP)%4])];}
  NSMutableArray<NSString *> *names=[NSMutableArray array];
  for(int p=0;p<CONTROLLER_BUTTONS;p++)if(controller_map_target(map[p])==action)[names addObject:settings_pad_button(p,family)];
@@ -1098,7 +1100,8 @@ static NSString *settings_pad_text(int action, const uint16_t *map, int family) 
 @property(strong) NSSegmentedControl *tabs;
 @property(strong) NSArray<NSView *> *pages;
 @property(strong) NSTextField *versionLabel;   /* the bottom-left corner */
-@property(strong) NSArray<NSButton *> *displayButtons;   /* the display page: contribute shaders, star the project */
+@property(strong) NSArray<NSButton *> *displayButtons;   /* the display page's own (none since 访问主页 is on every page) */
+@property(strong) NSButton *homeButton;   /* every page: 访问主页 */
 @property(strong) NSArray<NSButton *> *userButtons;   /* the user page: add a user */
 @property(strong) NSArray<NSButton *> *resetButtons;   /* the key bindings page: keyboard and mouse, controller */
 @property(strong) NSArray<NSButton *> *effectsButtons; /* the effects page: reset to defaults */
@@ -1138,8 +1141,28 @@ static NSString *settings_pad_text(int action, const uint16_t *map, int family) 
 
 #include "update_tab.h"   /* the 更新 page */
 #include "contrib_tab.h"   /* the 着色器贡献 page */
+#include "nick_row.h"   /* the player's nickname: a row on the 排行榜 and 截图分享 pages */
 #include "board_tab.h"   /* the 排行榜 page */
 #include "shot_tab.h"   /* the 截图分享 page */
+
+/* 访问主页 (user 2026-11-11): the site's home with this game, the view of the page shown (the 排行榜 page: the board, the
+   着色器贡献 page: the contributors, the 截图分享 page: the photo wall) and the player's codes: the board's anonymous code
+   (board_tab_code) and this game's contributor pseudonym (contrib_tab_pseudonym). Both are public names the site shows;
+   the ids they come from never leave the Mac. The site keeps them so it knows who came (its 我的排名). */
+static void settings_home_open_default(NSURL *url){if(url)[NSWorkspace.sharedWorkspace openURL:url];}
+static void (*settings_home_open)(NSURL *)=settings_home_open_default;   /* the probe points it elsewhere: no browser in a test */
+static NSURL *settings_home_url(NSInteger page){
+ NSURLComponents *u=contrib_tab_root()?:[NSURLComponents componentsWithString:@"https://mac-native-games.com/"];
+ u.path=@"/";
+ NSMutableArray *q=[NSMutableArray arrayWithObject:[NSURLQueryItem queryItemWithName:@"game" value:@GAME_INBOX_ID]];
+ if(page==SETTINGS_PAGE_BOARD)[q addObject:[NSURLQueryItem queryItemWithName:@"view" value:@"board"]];
+ else if(page==SETTINGS_PAGE_CONTRIB)[q addObject:[NSURLQueryItem queryItemWithName:@"view" value:@"contrib"]];
+ NSString *code=board_tab_code(),*player=contrib_tab_pseudonym(totk_contrib_path());
+ if(code)[q addObject:[NSURLQueryItem queryItemWithName:@"code" value:code]];
+ if(player)[q addObject:[NSURLQueryItem queryItemWithName:@"player" value:player]];
+ u.queryItems=q;if(page==SETTINGS_PAGE_SHOTS)u.fragment=@"wall";
+ return u.URL;
+}
 
 /* Where the player dragged the panel (user 2026-10-25: it can be moved), as the fraction of the free room left and below
    it, so a new opening and a resized window keep the spot; -1 = centred. The page shown last opens again. */
@@ -1258,12 +1281,12 @@ enum { SETTINGS_W = 740, SETTINGS_NARROW_W = 600, SETTINGS_ROW_H = 34, SETTINGS_
  for(NSButton *b in @[resetPad,resetKeys,toggle]){b.controlSize=NSControlSizeSmall;b.font=[NSFont systemFontOfSize:11];b.refusesFirstResponder=YES;[b sizeToFit];
   b.frame=NSMakeRect(0,5,b.frame.size.width,24);b.wantsLayer=YES;[self addSubview:b];}
  self.resetButtons=@[resetKeys,resetPad];self.listToggle=toggle;
- /* The display page's bottom right (user 2026-10-25, kept on the first page only): contribute the shaders and pipelines the
-    shared list lacks, and star the project. */
- NSButton *star=[NSButton buttonWithTitle:settings_text("⭐ 给作者点赞","⭐ Star the project") target:self action:@selector(star:)];
- for(NSButton *b in @[star]){b.controlSize=NSControlSizeSmall;b.font=[NSFont systemFontOfSize:11];b.refusesFirstResponder=YES;[b sizeToFit];
-  b.frame=NSMakeRect(0,5,b.frame.size.width,24);b.wantsLayer=YES;[self addSubview:b];}
- self.displayButtons=@[star];
+ /* Every page's bottom right (user 2026-11-11, was the display page's star): 访问主页, the site with the player's codes
+    (settings_home_url), so it knows who came. */
+ NSButton *home=[NSButton buttonWithTitle:settings_text("访问主页","Visit homepage") target:self action:@selector(visitHome:)];
+ home.controlSize=NSControlSizeSmall;home.font=[NSFont systemFontOfSize:11];home.refusesFirstResponder=YES;[home sizeToFit];
+ home.frame=NSMakeRect(0,5,home.frame.size.width,24);home.wantsLayer=YES;[self addSubview:home];self.homeButton=home;
+ self.displayButtons=@[];
  NSButton *resetEffects=[NSButton buttonWithTitle:settings_text("恢复默认","Reset to defaults") target:self action:@selector(resetEffects:)];
  resetEffects.controlSize=NSControlSizeSmall;resetEffects.font=[NSFont systemFontOfSize:11];resetEffects.refusesFirstResponder=YES;[resetEffects sizeToFit];
  resetEffects.frame=NSMakeRect(0,5,resetEffects.frame.size.width,24);resetEffects.wantsLayer=YES;[self addSubview:resetEffects];
@@ -1322,10 +1345,10 @@ enum { SETTINGS_W = 740, SETTINGS_NARROW_W = 600, SETTINGS_ROW_H = 34, SETTINGS_
    box.bordered=NO;box.wantsLayer=YES;box.layer.cornerRadius=5;box.refusesFirstResponder=YES;
    box.frame=NSMakeRect(cx[slot],3,cell,SETTINGS_BIND_ROW_H-8);
    box.panel=self;box.gameAction=a->action;box.slot=slot;
-   box.enabled=a->action==SETTINGS_BIND_PANEL?slot==2:slot<2||a->action<KEYMAP_SWITCH_BUTTONS;
+   box.enabled=a->action==SETTINGS_BIND_PANEL?slot==2:slot<2||a->action<KEYMAP_SWITCH_BUTTONS||a->action==KEYMAP_SCREENSHOT;
    [band addSubview:box];[self.bindingButtons addObject:box];
   }
-  if(a->action<KEYMAP_SWITCH_BUTTONS||a->action==SETTINGS_BIND_PANEL)[self.bindingTargets addObject:band];
+  if(a->action<KEYMAP_SWITCH_BUTTONS||a->action==SETTINGS_BIND_PANEL||a->action==KEYMAP_SCREENSHOT)[self.bindingTargets addObject:band];
   y+=SETTINGS_BIND_ROW_H;
  }
  list.frame=NSMakeRect(0,0,w,y+4);scroll.documentView=list;[page addSubview:scroll];self.bindingsScroll=scroll;
@@ -1351,36 +1374,45 @@ enum { SETTINGS_W = 740, SETTINGS_NARROW_W = 600, SETTINGS_ROW_H = 34, SETTINGS_
  [self.bindingsScroll.documentView scrollPoint:NSZeroPoint];   /* the list from its top (moving with a controller scrolls) */
  [self.window makeFirstResponder:self.window.contentView];   /* key 1 and Esc keep reaching the window */
 }
-/* The bottom right: on the display page contribute and star; on the key bindings page the list / drawings switch and the
-   reset of the device shown (both resets with the list). */
--(void)layoutFooter{
+/* The bottom right: 访问主页 on every page at the far right; before it the page's own: on the user page add a user, on
+   the effects page the reset, on the key bindings page the list / drawings switch and the reset of the device shown (both
+   resets with the list). The version at the bottom left gives way to them. */
+-(NSArray<NSButton *> *)footerOwn{
  BOOL bindings=self.page==SETTINGS_PAGE_BINDINGS;
- NSArray<NSButton *> *shown=self.page==SETTINGS_PAGE_DISPLAY?self.displayButtons:self.page==SETTINGS_PAGE_USERS?self.userButtons:
+ return self.page==SETTINGS_PAGE_DISPLAY?self.displayButtons:self.page==SETTINGS_PAGE_USERS?self.userButtons:
   self.page==SETTINGS_PAGE_EFFECTS?self.effectsButtons:!bindings?@[]:self.drawings?@[self.resetButtons[g_settings_bindings_device?1:0],self.listToggle]:@[self.resetButtons[1],self.resetButtons[0],self.listToggle];
+}
+-(void)layoutFooter{
+ NSArray<NSButton *> *shown=[self footerOwn];
  for(NSButton *b in [[[@[self.resetButtons[0],self.resetButtons[1],self.listToggle] arrayByAddingObjectsFromArray:self.displayButtons]
    arrayByAddingObjectsFromArray:self.effectsButtons] arrayByAddingObjectsFromArray:self.userButtons])b.hidden=![shown containsObject:b];
+ self.homeButton.hidden=NO;
  CGFloat right=self.panelW-14;
- for(NSButton *b in shown){b.frame=NSMakeRect(right-b.frame.size.width,5,b.frame.size.width,24);right-=b.frame.size.width+6;}
+ for(NSButton *b in [@[self.homeButton] arrayByAddingObjectsFromArray:shown]){b.frame=NSMakeRect(right-b.frame.size.width,5,b.frame.size.width,24);right-=b.frame.size.width+6;}
+ if([self.versionLabel.stringValue isEqualToString:settings_version_text()])[self fitVersion];
 }
+/* The version where the buttons leave room (230 pt at most). */
+-(void)fitVersion{self.versionLabel.frame=NSMakeRect(18,9,fmax(40,fmin(230,self.panelW-36-[self footerButtonsWidth])),16);}
 /* A result of the display page's buttons, in the bottom-left corner for a few seconds instead of the version. */
 -(void)note:(NSString *)text{
  self.versionLabel.stringValue=text;self.versionLabel.frame=NSMakeRect(18,9,self.panelW-36-[self footerButtonsWidth],16);
  __weak TOTKSettingsPanel *weak=self;NSString *shown=text;
  dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(6*NSEC_PER_SEC)),dispatch_get_main_queue(),^{
   TOTKSettingsPanel *panel=weak;if(!panel||![panel.versionLabel.stringValue isEqualToString:shown])return;
-  panel.versionLabel.stringValue=settings_version_text();panel.versionLabel.frame=NSMakeRect(18,9,230,16);});
+  panel.versionLabel.stringValue=settings_version_text();[panel fitVersion];});
 }
 -(CGFloat)footerButtonsWidth{
- NSArray<NSButton *> *shown=self.page==SETTINGS_PAGE_DISPLAY?self.displayButtons:self.page==SETTINGS_PAGE_USERS?self.userButtons:@[];
- CGFloat w=0;for(NSButton *b in shown)if(!b.hidden)w+=b.frame.size.width+6;return w;
+ CGFloat w=self.homeButton.frame.size.width+6;for(NSButton *b in [self footerOwn])if(!b.hidden)w+=b.frame.size.width+6;return w;
 }
 /* The panel's note about a row: the tab of the page shown. */
 static void settings_footer_note(NSString *text, BOOL bad) { (void)bad; [settingsPanel note:text]; }
 /* The effects page's reset: every row back to the game's own; the panel is made again so the titles say what is in force. */
 -(void)resetEffects:(id)sender{(void)sender;settings_effects_reset();dispatch_async(dispatch_get_main_queue(),^{settings_rebuild();});}
-/* The project's GitHub page, where the player stars it (as the launcher's star button). */
--(void)star:(id)sender{(void)sender;[NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:@TOTK_REPO_URL]];
- [self note:settings_text("谢谢支持！在打开的 GitHub 页面右上角点 Star","Thank you! Click Star at the top right of the GitHub page")];}
+/* 访问主页 (user 2026-11-11, was the star): the site, opened on what the page shown is about, with the player's codes
+   (settings_home_url) so the site knows who came. */
+-(void)visitHome:(id)sender{(void)sender;NSURL *u=settings_home_url(self.page);
+ fprintf(stderr,"[settings] 访问主页 %s\n",u.absoluteString.UTF8String?:"(no address)");if(settings_home_open)settings_home_open(u);
+ [self note:settings_text("已在浏览器里打开主页","The homepage is open in the browser")];}
 /* The user page's button: the game's text bar takes the name (the panel closes while it is up, as it does for the
    game's own keyboards); the user is kept, and the panel comes back with the users read again. */
 -(void)addUser:(NSButton *)button{
@@ -1415,6 +1447,7 @@ static void settings_footer_note(NSString *text, BOOL bad) { (void)bad; [setting
   if(g_settings_bindings_device){self.padOrder=[self.padDiagram order];for(NSUInteger i=0;i<self.padOrder.count;i++)[self.controllerTargets addObject:self.padDiagram];}
   for(NSButton *b in @[self.resetButtons[0],self.resetButtons[1],self.listToggle])if(!b.hidden)[self.controllerTargets addObject:b];
  }
+ [self.controllerTargets addObject:self.homeButton];   /* 访问主页, last on every page */
  if(self.controllerIndex>=(NSInteger)self.controllerTargets.count)self.controllerIndex=0;
  [self controllerHighlight];
 }
@@ -1458,16 +1491,21 @@ static void settings_footer_note(NSString *text, BOOL bad) { (void)bad; [setting
  int count;const SettingsAction *all=settings_actions(&count);
  for(int i=0;i<count;i++){
   const SettingsAction *a=&all[i];
-  if(pad&&a->action>=KEYMAP_SWITCH_BUTTONS&&a->action!=SETTINGS_BIND_PANEL)continue;   /* the sticks stay sticks on a controller */
+  if(pad&&a->action>=KEYMAP_SWITCH_BUTTONS&&a->action!=SETTINGS_BIND_PANEL&&a->action!=KEYMAP_SCREENSHOT)continue;   /* the sticks stay sticks on a controller */
   if(!pad&&a->action==SETTINGS_BIND_PANEL)continue;   /* key 1, fixed */
-  if(pad&&input>CONTROLLER_SWITCH_BUTTONS&&a->action==SETTINGS_BIND_PANEL)continue;   /* not a mouse button */
+  if(pad&&input>CONTROLLER_SWITCH_BUTTONS&&(a->action==SETTINGS_BIND_PANEL||a->action==KEYMAP_SCREENSHOT))continue;   /* not a mouse button */
   if(a->action<0){[menu addItem:[NSMenuItem sectionHeaderWithTitle:@(TOTK_UI(a->zh,a->en))]];continue;}
-  NSMenuItem *item=[[NSMenuItem alloc] initWithTitle:@(TOTK_UI(a->zh,a->en)) action:@selector(menuPicked:) keyEquivalent:@""];
-  item.target=self;item.tag=a->action;item.representedObject=@[@(input),@(pad)];item.state=a->action==now?NSControlStateValueOn:NSControlStateValueOff;[menu addItem:item];
+  /* A controller's screenshot is a hold added to what the button drives: its own tick beside the action's. */
+  BOOL hold=pad&&a->action==KEYMAP_SCREENSHOT;
+  NSMenuItem *item=[[NSMenuItem alloc] initWithTitle:hold?[NSString stringWithFormat:@(TOTK_UI("截图（长按 %d 秒）","Screenshot (hold %d s)")),CONTROLLER_SCREENSHOT_HOLD_MS/1000]:@(TOTK_UI(a->zh,a->en))
+   action:@selector(menuPicked:) keyEquivalent:@""];
+  item.target=self;item.tag=a->action;item.representedObject=@[@(input),@(pad)];
+  item.state=(hold?runtime_gamepad_screenshot_button()==input:a->action==now)?NSControlStateValueOn:NSControlStateValueOff;[menu addItem:item];
  }
  [menu addItem:[NSMenuItem separatorItem]];
  NSMenuItem *none=[[NSMenuItem alloc] initWithTitle:settings_text("无（不使用）","None (unused)") action:@selector(menuPicked:) keyEquivalent:@""];
- none.target=self;none.tag=-1;none.representedObject=@[@(input),@(pad)];none.state=now<0?NSControlStateValueOn:NSControlStateValueOff;[menu addItem:none];
+ none.target=self;none.tag=-1;none.representedObject=@[@(input),@(pad)];
+ none.state=now<0&&!(pad&&runtime_gamepad_screenshot_button()==input)?NSControlStateValueOn:NSControlStateValueOff;[menu addItem:none];
  return menu;
 }
 -(void)popMenuForInput:(int)input pad:(BOOL)pad at:(NSRect)at{
@@ -1480,6 +1518,8 @@ static void settings_footer_note(NSString *text, BOOL bad) { (void)bad; [setting
 }
 -(void)menuPicked:(NSMenuItem *)item{
  NSArray<NSNumber *> *what=item.representedObject;
+ /* None on a controller button: nothing at all, its screenshot hold too */
+ if(what[1].boolValue&&item.tag<0&&what[0].intValue==runtime_gamepad_screenshot_button())runtime_gamepad_screenshot_button_set(-1);
  if(what[1].boolValue)[self assignPad:what[0].intValue action:(int)item.tag];else [self assignInput:what[0].intValue action:(int)item.tag];
 }
 -(void)assignInput:(int)input action:(int)action{
@@ -1489,6 +1529,7 @@ static void settings_footer_note(NSString *text, BOOL bad) { (void)bad; [setting
  [self refreshBindings];
 }
 -(void)assignPad:(int)physical action:(int)action{
+ if(action==KEYMAP_SCREENSHOT){if(physical<=CONTROLLER_SWITCH_BUTTONS)runtime_gamepad_screenshot_button_set(physical);[self refreshBindings];return;}   /* a hold: what it drives stays */
  if(action==SETTINGS_BIND_PANEL){if(physical<=CONTROLLER_SWITCH_BUTTONS)runtime_gamepad_settings_button_set(physical);[self refreshBindings];return;}
  if(physical==runtime_gamepad_settings_button())runtime_gamepad_settings_button_set(-1);   /* it drives the game again; the panel goes back to L3 + R3 */
  uint16_t map[CONTROLLER_BUTTONS];uint8_t modes[CONTROLLER_BUTTONS];runtime_controller_map_get(map,modes);
@@ -1527,6 +1568,7 @@ static void settings_footer_note(NSString *text, BOOL bad) { (void)bad; [setting
   BOOL waiting=box==self.capturing;int action=box.gameAction;
   NSString *text=waiting?(box.slot==2?settings_text("请按手柄按钮…","Press a button…"):settings_text("请按键…","Press a key…")):
    action==SETTINGS_BIND_PANEL?(box.slot==0?@"1":box.slot==1?@"—":settings_panel_pad_text(family)):
+   action==KEYMAP_SCREENSHOT&&box.slot==2?settings_shot_pad_text(family):
    box.slot<2?settings_input_text(keys.slot[action][box.slot]):settings_pad_text(action,map,family);
   NSColor *color=waiting?NSColor.blackColor:box.enabled?[NSColor colorWithCalibratedWhite:0.95 alpha:1]:[NSColor colorWithCalibratedWhite:0.55 alpha:1];
   NSAttributedString *title=[[NSAttributedString alloc] initWithString:text attributes:@{NSFontAttributeName:[NSFont systemFontOfSize:11.5 weight:NSFontWeightMedium],
@@ -1586,6 +1628,7 @@ static void settings_footer_note(NSString *text, BOOL bad) { (void)bad; [setting
 -(void)bindPad:(int)physical{
  TOTKBindingButton *box=self.capturing;if(!box||box.slot!=2||physical<0||physical>=CONTROLLER_SWITCH_BUTTONS+1)return;
  if(box.gameAction==SETTINGS_BIND_PANEL){runtime_gamepad_settings_button_set(physical);[self endCapture];return;}
+ if(box.gameAction==KEYMAP_SCREENSHOT){runtime_gamepad_screenshot_button_set(physical);[self endCapture];return;}   /* a hold: what it drives stays */
  if(physical==runtime_gamepad_settings_button())runtime_gamepad_settings_button_set(-1);
  uint16_t map[CONTROLLER_BUTTONS];uint8_t modes[CONTROLLER_BUTTONS];runtime_controller_map_get(map,modes);
  int previous=-1;for(int p=0;p<=CONTROLLER_SWITCH_BUTTONS;p++)if(controller_map_target(map[p])==box.gameAction){previous=p;break;}
@@ -1599,6 +1642,7 @@ static void settings_footer_note(NSString *text, BOOL bad) { (void)bad; [setting
 -(void)clearBinding:(TOTKBindingButton *)box{
  [self endCapture];
  if(box.gameAction==SETTINGS_BIND_PANEL){if(box.slot==2)runtime_gamepad_settings_button_set(-1);}   /* back to L3 + R3 */
+ else if(box.gameAction==KEYMAP_SCREENSHOT&&box.slot==2)runtime_gamepad_screenshot_button_set(-1);   /* no button takes screenshots */
  else if(box.slot<2){KeyMap keys;runtime_keymap_get(&keys);if(keymap_bind(&keys,box.gameAction,box.slot,KEYMAP_NONE))runtime_keymap_set(&keys);}
  else{uint16_t map[CONTROLLER_BUTTONS];uint8_t modes[CONTROLLER_BUTTONS];runtime_controller_map_get(map,modes);
   for(int p=0;p<CONTROLLER_BUTTONS;p++)if(controller_map_target(map[p])==box.gameAction){map[p]=0;modes[p]=CONTROLLER_HOLD;}
@@ -1606,7 +1650,8 @@ static void settings_footer_note(NSString *text, BOOL bad) { (void)bad; [setting
  [self refreshBindings];
 }
 -(void)resetKeyboard:(id)sender{(void)sender;[self endCapture];runtime_keymap_reset();[self refreshBindings];}
--(void)resetController:(id)sender{(void)sender;[self endCapture];runtime_controller_map_reset();runtime_gamepad_settings_button_set(-1);[self refreshBindings];}
+-(void)resetController:(id)sender{(void)sender;[self endCapture];runtime_controller_map_reset();runtime_gamepad_settings_button_set(-1);
+ runtime_gamepad_screenshot_button_set(CONTROLLER_SCREENSHOT_DEFAULT);[self refreshBindings];}
 -(BOOL)controllerEnabled:(NSInteger)i{
  if(i<0||i>=(NSInteger)self.controllerTargets.count)return NO;
  if(self.page==SETTINGS_PAGE_BINDINGS)return YES;
