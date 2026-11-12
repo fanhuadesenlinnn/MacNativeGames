@@ -152,8 +152,8 @@ static NSString *contrib_file(NSString *data) {
     if (![fm createDirectoryAtPath:folder withIntermediateDirectories:YES attributes:nil error:nil]) return old;
     // the Mac's file (an iPhone / iPad contributes its own, totk_contrib_upload.h): the rows are the same
     // for every platform. Each game has a list of its own and so a file of its own in the folder: Tears of the Kingdom's
-    // without a suffix, Breath of the Wild's -botw, every other game's -<TOTK_GAME_DIR>, as the other games' issue form names
-    // it (.github/ISSUE_TEMPLATE/shader-list-other.yml). Ocarina of Time's used to be -botw's (user 2026-11-10: "要统一")
+    // without a suffix, Breath of the Wild's -botw, every other game's -<TOTK_GAME_DIR>.
+    // Ocarina of Time's used to be -botw's (user 2026-11-10: "要统一")
     NSString *mine = [folder stringByAppendingPathComponent:!strcmp(GAME_FOLDER, "TOTK") ? @"shader-list-contribution.txt"
                       : !strcmp(GAME_FOLDER, "BotW") ? @"shader-list-contribution-botw.txt"
                       : [NSString stringWithFormat:@"shader-list-contribution-%s.txt", TOTK_GAME_DIR]];
@@ -446,7 +446,7 @@ int runtime_app_launch(int argc, char **argv, char ***boot) {
         /* The commit the app was built from (build_app.py MNGSourceCommit): the HUD box shows it (runtime/frontend.m). */
         NSString *commit = [NSBundle.mainBundle objectForInfoDictionaryKey:@"MNGSourceCommit"];
         if ([commit isKindOfClass:NSString.class] && commit.length) setenv("TOTK_SOURCE_COMMIT", commit.UTF8String, 1);
-        NSString *contrib = env_or("TOTK_SHADER_CONTRIB", contrib_file(data));
+        NSString *contrib = totk_inbox_claim(env_or("TOTK_SHADER_CONTRIB", contrib_file(data)));   // this game's file only
         setenv("TOTK_SHADER_CONTRIB", contrib.fileSystemRepresentation, 1);
         { const char *seed = getenv("TOTK_SHADER_SEED_DIR");   // what this app serves leaves the file before the reminder counts it
           NSString *build = [root stringByAppendingPathComponent:@"build"];

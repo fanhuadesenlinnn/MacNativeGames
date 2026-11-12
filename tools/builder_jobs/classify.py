@@ -36,6 +36,7 @@ class Plan:
     app_name: str | None = None
     base: str | None = None
     update: str | None = None
+    update_version: int | None = None   # the chosen update's title version, to tell an installed app of the same version
     dlc: list = field(default_factory=list)
     keys: str | None = None
     firmware: str | None = None
@@ -219,7 +220,8 @@ def plan(items, work=None):
     if updates:
         supported = _supported(p.game)
         usable = [u for u in updates if u.version in supported] or updates
-        p.update = _newest(usable).path
+        newest = _newest(usable)
+        p.update, p.update_version = newest.path, newest.version
         skipped = [Path(u.path).name for u in updates if u not in usable]
         if skipped:
             p.notes.append(t('not a version this repository builds, left out: ', '本项目不支持的版本，不用：') + ', '.join(skipped))
@@ -231,10 +233,11 @@ def plan(items, work=None):
     p.fonts = fonts[-1].path if fonts else None
     b = repo.build_app()
     has_fonts = p.firmware or p.fonts or (work and b.fonts_valid(Path(work) / 'totk/extracted/firmware/shared-fonts'))
-    if GAME_SUFFIXES.get(Path(p.base).suffix.lower()) == 'nsp' and not has_fonts:
-        p.blocks.append(t('an NSP holds no system fonts: drop your unpacked firmware folder (or the shared-fonts folder of '
+    # build_app.py: an NSP holds no system fonts, nor does a Breath of the Wild card image (step_data_botw)
+    if (GAME_SUFFIXES.get(Path(p.base).suffix.lower()) == 'nsp' or p.game == 'botw') and not has_fonts:
+        p.blocks.append(t('this game file holds no system fonts (an NSP, or a Breath of the Wild card): drop your unpacked firmware folder (or the shared-fonts folder of '
                           'an earlier build) too',
-                          'NSP 不含系统字体：把解开的固件文件夹（或以前打包留下的 shared-fonts 文件夹）也放进来'))
+                          '这个游戏文件不含系统字体（NSP，或旷野之息的卡带）：把解开的固件文件夹（或以前打包留下的 shared-fonts 文件夹）也放进来'))
     p.blocks = p.keys_problems + p.blocks
     return p
 
