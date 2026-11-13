@@ -7,7 +7,7 @@ import SwiftUI
 struct HomePage: View {
     @EnvironmentObject var model: Model
     @State private var selected: String?
-    @State private var defaulted = false   // the first built game was chosen once; a card closed by hand stays closed
+    @State private var defaulted = false   // the first built game was chosen once, when the page first showed
 
     static let games = ["oot", "totk", "botw", "dkb", "pkp"]
 
@@ -35,7 +35,7 @@ struct HomePage: View {
                             let app = model.installed.first { $0.game == game }
                             GameCard(game: game, app: app, loading: !model.installedLoaded, selected: selected == game) {
                                 if !model.installedLoaded { return }
-                                if app != nil { selected = selected == game ? nil : game }
+                                if app != nil { selected = game }   // a second click keeps it chosen (user 2026-11-13)
                                 else { model.buildFor = game; model.page = "build" }
                             }
                         }
@@ -132,10 +132,30 @@ struct GameActions: View {
     @State private var gpu = "checking"   // MetalFX frame interpolation on this GPU (Tears of the Kingdom, Breath of the Wild)
     @State private var starting = false
     @State private var startStatus = ""
+    @State private var shaderLine = ""          // the Check shaders result, in words (tools/builder_jobs/shaders.py)
+    @State private var shaderUpdate = false     // the newest list adds something: the Update shaders button shows
+    @State private var checkingShaders = false
 
     /// Tears of the Kingdom and Breath of the Wild start through the Settings page's Play (tab_settings.play): the choices
     /// only Play passes (the 16x ground) go with it, and interpolation waits for the GPU check. The others open as apps.
-    private var startsWithSettings: Bool { model.pageApps.contains(where: { $0.app == app.app }) }
+    private var startsWithSettings: Bool { Model.pages(app.game).contains("settings") }
+
+    /// What the game's newest list adds to this app (tools/builder_jobs shaders: nothing is changed).
+    private func checkShaders() async {
+        checkingShaders = true; shaderUpdate = false
+        defer { checkingShaders = false }
+        do {
+            let data = try await Job.collect(["shaders", "--app", app.app])
+            let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+            if object?["ok"] as? Bool == true, let r = object?["result"] as? [String: Any] {
+                shaderLine = r["line"] as? String ?? ""; shaderUpdate = r["can_update"] as? Bool ?? false
+            } else {
+                shaderLine = object?["error"] as? String ?? String(decoding: data, as: UTF8.self)
+            }
+        } catch {
+            shaderLine = error.localizedDescription
+        }
+    }
 
     var body: some View {
         GroupBox {
@@ -175,9 +195,21 @@ struct GameActions: View {
                 default:
                     EmptyView()   // the reason above says why it cannot be updated now
                 }
+                if Model.shaderGames.contains(app.game ?? "") {   // only the shaders and pipelines, from the newest list (user 2026-11-13)
+                    HStack(alignment: .firstTextBaseline) {
+                        Button(T.checkShaders) { Task { await checkShaders() } }.disabled(checkingShaders || busy)
+                        if shaderUpdate {
+                            Button(T.updateShaders) { shaderUpdate = false; shaderLine = ""; model.updateShaders(app) }
+                                .buttonStyle(.borderedProminent).disabled(busy)
+                        }
+                        if checkingShaders { ProgressView().controlSize(.small) }
+                        Text(checkingShaders ? T.checkingShaders : shaderLine).font(.callout).foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                }
                 if model.pageApps.contains(where: { $0.app == app.app }) {   // the pages serve these games only
                     HStack {
-                        ForEach(T.gamePages, id: \.0) { id, label in
+                        ForEach(T.gamePages.filter { Model.pages(app.game).contains($0.0) }, id: \.0) { id, label in
                             // under the buttons, not a page of its own (user 2026-11-12); pressed again, it closes
                             Button(label) { section = section == id ? nil : id }
                                 .buttonStyle(.bordered).tint(section == id ? .accentColor : nil)

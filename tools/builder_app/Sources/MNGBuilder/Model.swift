@@ -81,8 +81,16 @@ final class Model: ObservableObject {
         Task { await classify() }
     }
 
-    /// The installed apps the pages besides building serve (Tears of the Kingdom, Breath of the Wild: tools/builder's games).
-    var pageApps: [InstalledReport.App] { installed.filter { $0.game == "totk" || $0.game == "botw" } }
+    /// The pages besides building each game has (tools/builder/games.py PAGES, which the backend enforces;
+    /// tests/test_launcher_pages.py checks the two agree). Ocarina of Time: Controls, Storage and Saves (user 2026-11-13).
+    static let gamePages: [String: [String]] = [
+        "totk": ["settings", "mods", "controls", "storage", "saves"],
+        "botw": ["settings", "mods", "controls", "storage", "saves"],
+        "oot": ["controls", "storage", "saves"],
+    ]
+    static func pages(_ game: String?) -> [String] { game.flatMap { gamePages[$0] } ?? [] }
+    /// The installed apps the pages besides building serve.
+    var pageApps: [InstalledReport.App] { installed.filter { !Model.pages($0.game).isEmpty } }
 
     /// Where the last look at the installed games is kept, so the games page shows them at once (user 2026-11-12).
     private static let rememberedInstalled = Paths.support.appendingPathComponent("installed.json")
@@ -209,6 +217,15 @@ final class Model: ObservableObject {
 
     /// An installed app, without files: the fastest update that fits (express, else fast; the job refuses a full one).
     func update(_ app: InstalledReport.App) { update(path: app.app) }
+
+    /// Only the shaders and pipelines the game's newest shared list adds (shader_update.py; user 2026-11-13).
+    func updateShaders(_ app: InstalledReport.App) {
+        guard phase != .building && phase != .cancelling else { return }
+        updating = app.app
+        start(BuildRequest(update: app.app, shaders: true))
+    }
+    /// The games whose shaders the Check shaders button compares with their newest list (shader_update.py LISTS).
+    static let shaderGames: Set<String> = ["totk", "botw", "oot"]
 
     /// work: a folder the Storage page moved the work folder to; the update records it in the app.
     func update(path: String, work: String? = nil) {
