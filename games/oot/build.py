@@ -3,6 +3,7 @@ import concurrent.futures
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import plistlib
 import shutil
@@ -19,6 +20,24 @@ def build_helpers():
     if root not in sys.path:sys.path.insert(0,root)
     import build_app
     return build_app
+
+TREE_SKIP=('__pycache__','*.pyc','.venv','build','extracted','rewritten','analysis')   # the build's own output and caches
+
+def sync_tree(source,tree):
+    """The work folder's copy of games/oot mirrors the checkout: files are copied (linked folders, the shared graphics
+    layer and zeldaVR, as their contents), and a file or folder the checkout no longer has is deleted. A copy that only
+    added files kept another branch's nvn_pool_sources.m, which the Makefile's wildcard compiled with this checkout's
+    headers (2026-11-13). The names in TREE_SKIP are neither copied nor deleted."""
+    import fnmatch
+    shutil.copytree(source,tree,dirs_exist_ok=True,ignore=shutil.ignore_patterns(*TREE_SKIP))
+    skip=lambda name:any(fnmatch.fnmatch(name,p) for p in TREE_SKIP)
+    for here,dirs,files in os.walk(tree,topdown=True):
+        rel=Path(here).relative_to(tree)
+        dirs[:]=[d for d in dirs if not skip(d)]
+        for name in list(dirs):
+            if not (source/rel/name).exists():shutil.rmtree(Path(here)/name);dirs.remove(name)
+        for name in files:
+            if not skip(name) and not (source/rel/name).exists():(Path(here)/name).unlink()
 
 def sha(path):
     h=hashlib.sha256()
@@ -168,7 +187,7 @@ def verify_shader_resources(tree):
     seed=tree/'build/shader-seed/oot';libraries=tree/'build/shader-libs'
     if not seed.exists():return None   # explicit development packages from before offline preparation
     metadata=json.loads((seed/'seed-manifest.json').read_text())
-    chain=(GAME/'third_party/d2r_gfx/gfx/nvn/dmsh_chain.h').read_text().split('"')[1]
+    chain=re.search(r'#define DMSH_CHAIN "([^"]+)"\s*/\* game: oot\b',(GAME/'third_party/d2r_gfx/gfx/nvn/dmsh_chain.h').read_text())[1]   # the shared layer's line for this game
     imported=imported_romfs(tree)   # the seed is translated from this tree's own RomFS image (#2009: images differ by dump)
     if (metadata.get('version')!='oot' or metadata.get('source_romfs_sha256')!=imported['sha256'] or
         metadata.get('translator_sha256')!=sha(GAME/'prebuilt/macos-arm64/totk_xlate') or
@@ -418,7 +437,7 @@ def update_runtime(app,work=None):
         if not told:print('waiting for the game to close',flush=True);told=True
         time.sleep(5)
     start=time.monotonic()
-    shutil.copytree(GAME,tree,dirs_exist_ok=True,ignore=shutil.ignore_patterns('__pycache__','*.pyc','.venv','build','extracted','rewritten','analysis'))
+    sync_tree(GAME,tree)
     scripts=str(GAME/'scripts')
     if scripts not in sys.path:sys.path.insert(0,scripts)
     from prepare_ns2_seed import translation_context
@@ -505,7 +524,7 @@ def build(args, source):
             if time.monotonic()>deadline:raise RuntimeError('game did not finish its normal close; App left untouched')
             time.sleep(1)
     work.mkdir(parents=True,exist_ok=True);tree=work/'oot';logs=work/'logs';logs.mkdir(exist_ok=True)
-    shutil.copytree(GAME,tree,dirs_exist_ok=True,ignore=shutil.ignore_patterns('__pycache__','*.pyc','.venv','build','extracted','rewritten','analysis'))
+    sync_tree(GAME,tree)
     env=dict(os.environ,DM_RULESET='native',DM_PRIVATE_GATES='0')
     def run(cmd,name,cwd=tree):
         print(name,flush=True)
@@ -581,5 +600,5 @@ def build(args, source):
     else:
      package_app(work,tree,out,'library' if args.mac_game_data_folder else args.mac_game_data,args.mac_game_data_folder)
     print(f'Built {out}; native gameplay validation is recorded separately.',flush=True)
-    chain=(GAME/'third_party/d2r_gfx/gfx/nvn/dmsh_chain.h').read_text().split('"')[1]
+    chain=re.search(r'#define DMSH_CHAIN "([^"]+)"\s*/\* game: oot\b',(GAME/'third_party/d2r_gfx/gfx/nvn/dmsh_chain.h').read_text())[1]   # the shared layer's line for this game
     return out,tree,expected,chain

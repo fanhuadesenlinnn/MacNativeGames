@@ -25,6 +25,8 @@ static inline uint32_t ctl_code_len(const uint8_t *c) { uint32_t n; memcpy(&n, c
 static inline int ctl_stage(const uint8_t *c, const uint8_t *code) {
     if (!nvn2_ctl(c)) { uint32_t st; memcpy(&st, c + 0x714, 4); return st <= 5 ? (int)st : -1; }
     if (c[0x56] == 5) return 5;
+    if (c[0x56] == 6) return 3;
+    if (c[0x56] == 7) return 4;
     uint32_t w0; memcpy(&w0, code, 4);
     static const int from_sph[6] = {0, 0, 3, 4, 2, 1};
     unsigned type = (w0 >> 10) & 0xf;
@@ -42,11 +44,21 @@ static inline uint32_t ctl_sph_word0(const uint8_t *c, const uint8_t *code) { ui
 // The NVN2 key rule's name: a Switch 2 seed records the one its keys were made with (prepare_ns2_seed.py shader_key_rule),
 // and update_runtime.py makes the seed again when the runtime's is another (its keys would name no shader the runtime asks for).
 // A new rule takes a new name here and in ns2_shader_corpus.py KEY_RULE (tests/test_ns2_key_rule.py checks they are equal).
-#define NVN2_KEY_RULE "nvn2-ctl48-zero-08-20-30"
+// The rule is the game's: Ocarina of Time keeps its own (only +0x30 as zero; games/oot/scripts/ns2_shader_corpus.py), which
+// names its shader list, its seeds and its players' contributions. The shared layer gave it the rule above for a while
+// (2026-11-13): its seed named 0 of the list's 8,411 shaders. Readers take a game's line by its tag (update_runtime.py).
+#if defined(GAME_OOT)
+#define NVN2_KEY_RULE "nvn2-ctl48-zero-30"   /* game: oot */
+#define NVN2_KEY_ZERO_08_20 0
+#else
+#define NVN2_KEY_RULE "nvn2-ctl48-zero-08-20-30"   /* game: totk (Donkey Kong Bananza and Pokemon Pokopia, built with games/totk) */
+#define NVN2_KEY_ZERO_08_20 1
+#endif
 static inline void ctl_key_update(CC_SHA256_CTX *ctx, const uint8_t *c) {
     if (nvn2_ctl(c)) {
         uint8_t k[0x48]; memcpy(k, c, sizeof k);
-        memset(k + 0x08, 0, 4); memset(k + 0x20, 0, 8); memset(k + 0x30, 0, 4);
+        if (NVN2_KEY_ZERO_08_20) { memset(k + 0x08, 0, 4); memset(k + 0x20, 0, 8); }
+        memset(k + 0x30, 0, 4);
         CC_SHA256_Update(ctx, k, sizeof k); return;
     }
     uint32_t n; memcpy(&n, c + 0x20, 4);

@@ -86,13 +86,13 @@ def app_identity(app):
 def runtime_chain():
     """The translation chain of this repository's runtime (DMSH_CHAIN)."""
     text = (build_app.GAME / 'third_party/d2r_gfx/gfx/nvn/dmsh_chain.h').read_text()
-    return re.search(r'#define DMSH_CHAIN "([^"]+)"', text).group(1)
+    return re.search(r'#define DMSH_CHAIN "([^"]+)"\s*/\* game: totk\b', text).group(1)   # the shared layer's line for the games built with games/totk
 
 
 def runtime_key_rule():
     """The Switch 2 shader key rule of this repository's runtime (nvn_ctl.h NVN2_KEY_RULE)."""
     text = (build_app.GAME / 'third_party/d2r_gfx/gfx/nvn/nvn_ctl.h').read_text()
-    return re.search(r'#define NVN2_KEY_RULE "([^"]+)"', text).group(1)
+    return re.search(r'#define NVN2_KEY_RULE "([^"]+)"\s*/\* game: totk\b', text).group(1)   # the line of the games built with games/totk
 
 
 def check_seed_chain(res, chain, *, remake=False, key_rule=None):
