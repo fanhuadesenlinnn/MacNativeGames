@@ -9,7 +9,50 @@ Its Settings, Mods, Controls, Storage and Saves pages (opened under a game's car
 behind them stay in `tools/builder`, the models the pages call through `tools/builder_jobs/tab_*.py`
 ([builder.md](builder.md)).
 
-## Make it
+## Download builds
+
+The recommended download on GitHub Releases is `MNG-Launcher-<version>-macOS-arm64.dmg`.
+Open it, drag `MNG Launcher.app` to Applications, eject the image, then open the installed app.
+The ZIP is an alternative. Official downloads are Developer ID signed and Apple notarized.
+Players do not re-sign the downloaded Launcher, configure signing certificates or submit it for notarization.
+
+A portable build includes Python and its matching source snapshot; players do not compile the Launcher or
+need a checkout. At first use, the source is verified and extracted to
+`~/Library/Application Support/MacNativeGames/Builder/sources/<archive-sha256>`. Old source versions remain
+available to games that recorded them. Building a game still requires Apple's command line tools and the
+player's own game files and keys.
+
+## Build a portable copy locally
+
+Local compilation is supported independently of the maintainer's signing credentials and release tools.
+It automatically uses an ad-hoc signature and needs no Developer ID certificate or developer membership.
+Choose this route only for a source build; do not replace an official downloaded Launcher as an installation step.
+Use an Apple silicon Mac with the command line tools. Commit the source you want to bundle first, then run:
+
+```sh
+python3 tools/builder_app/make_app.py --portable --version 1.0.0 \
+  --scratch /path/outside-checkout/swift \
+  -o '/path/outside-checkout/MNG Launcher.app' \
+  --zip /path/outside-checkout/MNG-Launcher-1.0.0-macOS-arm64.zip
+```
+
+This makes an **ad-hoc signed local build**, not an Apple-notarized official download. Outputs must be outside
+the checkout. The builder refuses dirty tracked source, missing required dependencies and local instruction/key
+files; untracked and ignored files are never included. ZIP creation preserves symlinks and ordinary resources,
+while omitting extended attributes so Archive Utility cannot add AppleDouble (`._`) files.
+
+Run its regression tests with:
+
+```sh
+python3 -m pip install -r games/totk/requirements.txt
+python3 -m unittest discover -s tests -p 'test_launcher_*.py' -v
+```
+
+The **Validate Launcher preview (not notarized)** Actions workflow runs these tests, builds the portable app and
+stores its ZIP as a short-lived Actions artifact for testing. It does not publish a GitHub Release.
+Official signing, notarization and release automation are maintained separately from this repository.
+
+## Make a development app
 
 With the Xcode command line tools (`xcode-select --install`) and this checkout:
 
