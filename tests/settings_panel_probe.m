@@ -893,6 +893,13 @@ static void contrib_probe(void) {
     window = probe_window();
     window.contentView = [[TOTKInputView alloc] initWithFrame:NSMakeRect(0, 0, 1280, 720)];
     settings_home_open = probe_home_open; homeOpens = 0;
+    /* Opened on another page, the board and contributors pages read nothing (2026-11-15: the panel is made again at
+       every opening, and each opening read both from the site); shown, below, they read at once. */
+    g_settings_page = SETTINGS_PAGE_DISPLAY; settings_show(1); [settingsPanel refresh];
+    TOTKContribPage *unseenContrib = (TOTKContribPage *)settingsPanel.pages[SETTINGS_PAGE_CONTRIB];
+    TOTKBoardPage *unseenBoard = (TOTKBoardPage *)settingsPanel.pages[SETTINGS_PAGE_BOARD];
+    assert(!unseenContrib.fetching && !unseenContrib.fetchedAt && !unseenBoard.fetching && !unseenBoard.fetchedAt);
+    settings_show(0);
     /* No install id yet: the contributors without a player, and no id made by asking. */
     g_settings_page = SETTINGS_PAGE_CONTRIB; settings_show(1);
     TOTKContribPage *page = (TOTKContribPage *)settingsPanel.pages[SETTINGS_PAGE_CONTRIB];
@@ -1634,7 +1641,9 @@ int main(int argc, const char **argv) { @autoreleasepool {
     assert([actions.itemArray.firstObject.title isEqualToString:@"E"] && ticked && ticked.tag == KEYMAP_A && jump && [actions.itemArray.lastObject.title isEqualToString:@"None (unused)"]);
     [settingsPanel menuPicked:jump]; runtime_keymap_get(&keysNow);   /* E jumps now (with Space); confirm keeps Return */
     assert(keysNow.slot[KEYMAP_X][0] == 49 && keysNow.slot[KEYMAP_X][1] == 14 && keysNow.slot[KEYMAP_A][0] == 36 && keysNow.slot[KEYMAP_A][1] == KEYMAP_NONE);
-    [settingsPanel assignInput:36 action:-1]; assert([diagram_missing(0) isEqualToString:@"No key: Confirm / Interact"]);
+    [settingsPanel assignInput:36 action:-1]; NSString *missing = diagram_missing(0);
+    if (![missing isEqualToString:@"No key: Confirm / Interact"]) fprintf(stderr, "diagram_missing(0): %s\n", missing.UTF8String);
+    assert([missing isEqualToString:@"No key: Confirm / Interact"]);
     [settingsPanel.resetButtons[0] performClick:nil]; assert(diagram_missing(0) == nil);
     settingsPanel.deviceTabs.selectedSegment = 1; [settingsPanel deviceChanged:settingsPanel.deviceTabs];
     assert(settingsPanel.keyboardDiagram.hidden && !settingsPanel.padDiagram.hidden && settingsPanel.resetButtons[0].hidden && !settingsPanel.resetButtons[1].hidden);
