@@ -71,6 +71,22 @@ class QuickList(unittest.TestCase):
     def test_the_title_rows_name_the_quick_build_s_shaders(self):
         self.assertEqual(self.lst.title_keys(), {variant(n)[:64] for n in (1, 2, 5)})
 
+    def test_a_quick_build_also_takes_the_mesh_rows_shaders(self):
+        # user 2026-11-15: "快速启动 默认 预热 网格管线" -- a quick App compiled every mesh pipeline at its first draw
+        # (a cold world entry: 32 of them, 75 s); their shaders (task, mesh, fragment) go into the quick seed so the
+        # packaging warms them into the pipeline archive
+        self.lst.add_warm(('M', variant(7), render_key(variant(8), variant(9))), 'm')
+        self.lst.add_warm(('M', '-', render_key(variant(10), variant(2))), 'm')
+        self.assertEqual(self.lst.quick_keys(), {variant(n)[:64] for n in (1, 2, 5, 7, 8, 9, 10)})
+        self.assertEqual(self.lst.title_keys(), {variant(n)[:64] for n in (1, 2, 5)})   # the title rows alone, as before
+
+    def test_a_quick_build_also_takes_every_compute_and_tile_read_pipeline(self):
+        # user 2026-11-15: the compute (C) and tile-read (T) pipelines are warmed by default too, as the mesh ones
+        self.lst.add_warm(('C', variant(11)), 'm')
+        self.lst.add_warm(('T', render_key(variant(12), variant(13))), 'm')
+        self.assertEqual(self.lst.quick_keys(), {variant(n)[:64] for n in (1, 2, 5, 11, 12, 13)})
+        self.assertNotIn(variant(3)[:64], self.lst.quick_keys())   # an R row's shaders still only when it is a title row
+
     def test_a_list_without_title_rows_names_none(self):
         lst = self.shader_list.ShaderList()
         lst.add_warm(('R', render_key(variant(3), variant(4))), 'm')
@@ -184,6 +200,35 @@ class ShaderMode(unittest.TestCase):
             self.build.title_shader_file(Path(self.tmp.name) / 'tree', shared)
         self.assertIn('no title rows', str(e.exception))
 
+    def test_the_quick_seed_file_names_the_mesh_rows_shaders(self):
+        name = lambda v: v.encode().ljust(80, b'\0')
+        mesh_key = (name(variant(8)) + name(variant(9)) + bytes(544 - 160)).hex()
+        title_key = (name(variant(1)) + name(variant(2)) + bytes(544 - 160)).hex()
+        shared = Path(self.tmp.name) / 'shader_list.tsv'
+        shared.write_text(f'# list\nR\t{title_key}\tt\nM\t{variant(7)}\t{mesh_key}\tm\n')
+        written = self.build.title_shader_file(Path(self.tmp.name) / 'tree', shared).read_text().split()
+        self.assertEqual(set(written), {variant(n)[:64] for n in (1, 2, 7, 8, 9)})
+
+    def test_the_archive_is_built_from_the_libraries_the_app_carries(self):
+        # 2026-11-15: the packaging tool loaded the full build's libraries (TOTK_NATIVE_DIR/shader-libs) for a quick App,
+        # whose own are shader-libs-title: 494 of its 537 libraries differ in bytes, and the game's Metal refused 531 of
+        # 602 archived pipelines ("Unable to find function main0"). The tool now takes the mode's libraries and names
+        # them in its report, and packaging stops when they are not the ones the App carries.
+        tree = Path(self.tmp.name)
+        libraries = self.build.shader_dirs(tree, 'title')[1]
+        libraries.mkdir(parents=True)
+        self.build.check_archive_libraries({'libs': str(libraries)}, libraries)
+        with self.assertRaisesRegex(ValueError, 'libraries'):
+            self.build.check_archive_libraries({'libs': str(tree / 'build/shader-libs')}, libraries)
+        with self.assertRaisesRegex(ValueError, 'libraries'):
+            self.build.check_archive_libraries({}, libraries)   # a tool that does not say which ones it took
+        text = (GAME / 'build.py').read_text()
+        self.assertIn("TOTK_SHADER_LIBS_DIR=str(libraries)", text)
+        self.assertIn("check_archive_libraries(report,libraries)", text)
+        gfx = (ROOT / 'games/totk/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m').read_text()
+        self.assertIn('getenv("TOTK_SHADER_LIBS_DIR")', gfx)
+        self.assertIn('\\"libs\\": \\"%s\\"', gfx)
+
     def test_a_title_build_keeps_its_own_folders(self):
         # 2026-11-13: a title build in the full build's work folder deleted 3,081 pipeline archive files of the full
         # build and put all 64,607 libraries into the quick app's 2.7 GB shader bundle
@@ -193,7 +238,9 @@ class ShaderMode(unittest.TestCase):
         self.assertTrue(set(full[:2]).isdisjoint(title[:2]))
         self.assertEqual(title[2], '-title')
         text = (GAME / 'build.py').read_text()
-        for used in ("cache=folder/(chain+suffix)", "target=tree/f'build/pipelines{suffix}'",
+        # the pipeline cache: one per kind, kept across chains (test_oot_archive_lists.CacheKeptAcrossChains)
+        self.assertEqual(self.build.pipeline_cache(tree, '-title'), tree / 'archive-title')
+        for used in ("cache=pipeline_cache(folder,suffix)","target=tree/f'build/pipelines{suffix}'",
                      "bundle=tree/f'build/shader-bundles/ShaderData-oot{suffix}.bundle'", "'--output',seed,", "'--out',libraries,"):
             self.assertIn(used, text)
 
@@ -274,7 +321,7 @@ class LauncherQuickStart(unittest.TestCase):
             self.build_job.command({'update': '/Apps/Ocarina of Time.app'})
         self.assertIsNone(seen['env'])   # an ordinary update is judged as before
 
-    def test_the_card_button_follows_the_diagnostic_page_and_sends_the_same_request(self):
+    def test_the_card_button_follows_the_game_pages_and_sends_the_same_request(self):
         swift = ROOT / 'tools/builder_app/Sources/MNGBuilder'
         home = (swift / 'HomePage.swift').read_text()
         self.assertLess(home.index('ForEach(T.gamePages.filter'), home.index('Button(T.quickStart) { model.quickStart(app) }'))
@@ -290,6 +337,54 @@ class LauncherQuickStart(unittest.TestCase):
         self.assertIn('if app.shaders == "title"', (swift / 'HomePage.swift').read_text())
         self.assertIn('model.updateShaders(app)', (swift / 'HomePage.swift').read_text())
         self.assertIn('var quick: Bool? = nil', (swift / 'Reports.swift').read_text())
+
+
+class QuickStartCarriesDiagnostics(unittest.TestCase):
+    """user 2026-11-15: "去掉诊断模式 快速启动 默认带诊断": the Launcher's 诊断模式 page is gone; a quick App (MNGShaders 'title')
+    starts with every diagnostic of a debug session however it is opened (app/launcher.m), with a run folder of its own for
+    the per-frame record. A full App's start stays clean (tests/test_launcher_play_clean.py)."""
+    SWITCHES = ('TOTK_DEBUG_LOG', 'TOTK_LONGFRAME_DETAIL', 'TOTK_SVC_STATS', 'TOTK_SURVEY_SHADER_LOG', 'DM_NVN_TSV', 'DM_NVN_UPTIME')
+
+    def branches(self):
+        text = (GAME / 'app/launcher.m').read_text()
+        start = text.index('if (quick) {')
+        middle = text.index('} else {', start)
+        end = text.index('unsetenv("TOTK_AUTOLOAD")', middle)
+        return text[start:middle], text[middle:end], text[:start] + text[end:]
+
+    def test_a_quick_app_starts_with_every_diagnostic(self):
+        quick, _, _ = self.branches()
+        for name in self.SWITCHES:
+            # overwrite 0: a test start's own choice (its record path, a switch it turns off) is kept
+            self.assertRegex(quick, rf'setenv\("{name}", [^;]*, 0\)', name)
+        self.assertIn('Logs/MacNativeGames/diagnostics', quick)   # the run folder of its per-frame record
+        self.assertIn('frames.tsv', quick)
+
+    def test_a_full_app_starts_with_none(self):
+        _, full, rest = self.branches()
+        for name in self.SWITCHES:
+            self.assertNotIn(f'"{name}"', full, name)
+            self.assertNotIn(f'setenv("{name}"', rest, name)
+
+    def test_the_diagnostic_page_is_gone(self):
+        from tools.builder import games
+        from tools.builder_jobs import tabs
+        self.assertNotIn('diag', tabs.TABS)
+        self.assertTrue(all('diag' not in pages for pages in games.PAGES.values()))
+        self.assertFalse((ROOT / 'tools/builder_jobs/tab_diag.py').exists())
+        swift = ROOT / 'tools/builder_app/Sources/MNGBuilder'
+        self.assertFalse((swift / 'DiagTab.swift').exists())
+        for name in ('Model.swift', 'HomePage.swift', 'Strings.swift'):
+            text = (swift / name).read_text()
+            self.assertNotIn('"diag"', text, name)
+            self.assertNotIn('DiagPage', text, name)
+
+    def test_the_quick_start_says_it_carries_the_diagnostics(self):
+        strings = (ROOT / 'tools/builder_app/Sources/MNGBuilder/Strings.swift').read_text()
+        start = strings.index('static let quickStartHelp')
+        definition = strings[start:strings.index('static let', start + 1)]   # both languages, over two lines
+        self.assertIn('诊断', definition)
+        self.assertIn('diagnostic', definition)
 
 
 class NoSetuidPs(unittest.TestCase):

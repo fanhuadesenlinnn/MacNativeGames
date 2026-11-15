@@ -1249,7 +1249,7 @@ def build_device_translator(tree, logs):
     background instead of skipping its draws until the Mac fills it in."""
     prebuilt = [tree / 'prebuilt/ios-arm64' / name for name in ('libtotk_xlate.a', 'libtotk_xlate_bootstrap.o')]
     for lib in prebuilt:
-        want = (lib.parent / (lib.name + '.sha256')).read_text().strip()
+        want = (lib.parent / (lib.name + '.sha256')).read_text().split()[0]
         if not lib.is_file() or sha256(lib) != want:
             raise BuildError(f'{lib}: not the file this repository ships (its SHA-256 differs from {lib.name}.sha256); '
                              f'check it out again, or rebuild both with games/totk/tools/totk_xlate/publish_ios_lib.sh')
@@ -1275,7 +1275,7 @@ def build_device_translator(tree, logs):
 def check_translator(tree):
     """The shader translation service: a native program in this repository (no .NET needed to build or to play)."""
     translator = tree / 'prebuilt/macos-arm64/totk_xlate'
-    want = (translator.parent / 'totk_xlate.sha256').read_text().strip()
+    want = (translator.parent / 'totk_xlate.sha256').read_text().split()[0]
     if not translator.is_file() or sha256(translator) != want:
         raise BuildError(f'{translator}: not the shader translator this repository ships (its SHA-256 differs from '
                          f'totk_xlate.sha256); check it out again, or rebuild it with games/totk/tools/totk_xlate/publish_native.sh')
@@ -1594,7 +1594,7 @@ def data_bundle(tree, version, logs, *, bundle_id=BUNDLE_ID, display_version=Non
         say(f'4/4 app: signing the game data once (a minute or two; later builds reuse it): {why}')
         clone(image, tmp / 'Contents/Resources/romfs.bin')
         (tmp / 'Contents/Info.plist').write_bytes(info)
-        run(['codesign', '--force', '--sign', '-', tmp], logs / f'sign-data-{version}.log')
+        run(['codesign', '--force', '--sign', '-', tmp], logs / f'sign-data-{version}.log')   # nested: not the app
         # Checked once here, where the 16 GB are hashed anyway; an app carrying this bundle checks only its own seal (which
         # records this bundle's signature), not --deep (55 s on each packaging, 2026-10-21).
         run(['codesign', '--verify', '--strict', tmp], logs / f'verify-data-{version}.log')
@@ -1941,7 +1941,7 @@ def seal_shader_bundle(bundle, seed, libs, version, logs, bundle_id):
     (tmp / 'Contents/Info.plist').write_bytes(plistlib.dumps(dict(
         CFBundleIdentifier=f'{bundle_id}.shaders.{version}', CFBundleName='Startup shaders', CFBundlePackageType='BNDL',
         CFBundleShortVersionString=VERSIONS[version]['display_version'], CFBundleVersion='1')))
-    run(['codesign', '--force', '--sign', '-', tmp], logs / f'sign-shaders-{version}.log')
+    run(['codesign', '--force', '--sign', '-', tmp], logs / f'sign-shaders-{version}.log')   # nested: not the app
     run(['codesign', '--verify', '--strict', tmp], logs / f'verify-shaders-{version}.log')
     if bundle.exists():
         shutil.rmtree(bundle)
@@ -2261,13 +2261,26 @@ def mac_pipeline_files(made, seed, arch, chain):
     seed.mkdir(parents=True, exist_ok=True)
     for old in seed.glob('pipelines-*'):
         old.unlink()
+    # Each key belongs to one file: the one the tool itself takes (totk_pipeline_archive_publish.h par_pub_scan: the key
+    # lists oldest first by modification time, then by name; a later file wins a key both list). A pipeline written again
+    # (par_stale) stays listed in its old file, which keeps its other keys; until 2026-11-15 the index listed such a key
+    # twice, the old file first by name, and the game takes a key's first row (par_load_prebuilt): it used the stale
+    # pipeline, which Metal refused (14 of a quick App's 124 mesh pipelines compiled again at every start).
+    batches = sorted((p.with_suffix('.keys') for p in made.glob('*.metalarchive') if p.with_suffix('.keys').is_file()),
+                     key=lambda k: (k.stat().st_mtime, k.stem))
+    owner = {}
+    for keys in batches:
+        for key in keys.read_text().split('\n'):
+            if key:
+                owner[key] = keys.stem
     index = []
-    for archive in sorted(made.glob('*.metalarchive')):
-        keys = archive.with_suffix('.keys')
-        if not keys.is_file():
-            continue
-        clone(archive, seed / f'pipelines-{arch}-{archive.stem}.metalarchive')
-        index += [f'{key}\t{archive.stem}' for key in keys.read_text().split('\n') if key]
+    for keys in batches:
+        mine = [key for key in keys.read_text().split('\n') if key and owner.get(key) == keys.stem]
+        if not mine:
+            continue   # every key it lists was written again later: the App does not carry it
+        mine = list(dict.fromkeys(mine))
+        clone(keys.with_suffix('.metalarchive'), seed / f'pipelines-{arch}-{keys.stem}.metalarchive')
+        index += [f'{key}\t{keys.stem}' for key in mine]
     if not index:
         return 0
     # #2070: the compute shaders this GPU's Metal compiler built only with their float adds lowered (nvn_float_rmw.h): the
@@ -2918,7 +2931,7 @@ def step_shaders_botw(tree, botw, logs, *, version='botw160', shader_list=None):
         say('3/4 shaders: building SPIRV-Cross with clang')
         build_spirv_cross(tree, logs)
     translator = tree / 'prebuilt/macos-arm64/totk_xlate'
-    want = (translator.parent / 'totk_xlate.sha256').read_text().strip()
+    want = (translator.parent / 'totk_xlate.sha256').read_text().split()[0]
     if not translator.is_file() or sha256(translator) != want:
         raise BuildError(f'{translator}: not the shader translator this repository ships (its SHA-256 differs from '
                          f'totk_xlate.sha256); check it out again, or rebuild it with games/totk/tools/totk_xlate/publish_native.sh')

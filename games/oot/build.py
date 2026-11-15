@@ -120,12 +120,14 @@ def shader_dirs(tree, mode='full'):
     return tree/f'build/shader-seed{suffix}/oot',tree/f'build/shader-libs{suffix}',suffix
 
 def title_shader_file(tree, shared):
-    """The shaders the title rows of the shared list name, written for prepare_ns2_seed.py --only (a 'title' build)."""
-    keys=oot_shader_list().ShaderList.load(shared).title_keys()
-    if not keys:raise ValueError(f'{shared} has no title rows (flag t): a quick build has nothing to take; record them first (TOTK_PSO_CAPTURE, shader_list.py merge --title)')
+    """The shaders of the shared list's title rows and of its compute, tile-read and mesh pipelines (shader_list.py
+    quick_keys), written for prepare_ns2_seed.py --only (a 'title' build): the packaging then warms those pipelines too."""
+    lst=oot_shader_list().ShaderList.load(shared)
+    if not lst.title_keys():raise ValueError(f'{shared} has no title rows (flag t): a quick build has nothing to take; record them first (TOTK_PSO_CAPTURE, shader_list.py merge --title)')
+    keys=lst.quick_keys()
     path=tree/'build/shader-seed-title.txt';path.parent.mkdir(parents=True,exist_ok=True)
     path.write_text(''.join(k+'\n' for k in sorted(keys)))
-    print(f'quick build: the {len(keys)} shaders of the title rows; the game translates the rest at first use',flush=True)
+    print(f'quick build: the {len(keys)} shaders of the title rows and the compute, tile-read and mesh pipelines; the game translates the rest at first use',flush=True)
     return path
 
 def oot_shader_list():
@@ -274,12 +276,29 @@ def shader_bundle(tree,record,mode='full'):
     (temporary/'Contents/Info.plist').write_bytes(plistlib.dumps(dict(
         CFBundleIdentifier='org.macnativegames.oot.shaders.oot',CFBundleName='Startup shaders',
         CFBundlePackageType='BNDL',CFBundleShortVersionString='131072',CFBundleVersion='1')))
-    subprocess.run(['codesign','--force','--sign','-',temporary],check=True)
+    subprocess.run(['codesign','--force','--sign','-',temporary],check=True)   # nested: not the app
     subprocess.run(['codesign','--verify','--strict',temporary],check=True)
     old=bundle.with_name(bundle.name+'.previous-'+str(time.time_ns()))
     if bundle.exists():bundle.rename(old)
     temporary.rename(bundle);stamp.write_text(json.dumps(want)+'\n')
     return bundle
+
+def pipeline_cache(folder, suffix):
+    """The pipeline-archive tool's folder for one kind of App ('archive' full, 'archive-title' quick), kept from one chain
+    to the next (user 2026-11-15: "mac会有同样问题吗？"). It was named after the chain, so every new chain began empty:
+    v28's full update compiled all 28,714 pipelines in 2,546 s beside v27's folder, although only 18 of 18,661 shaders
+    changed. The tool runs with TOTK_PAR_RECHECK=1 and Metal finds a pipeline only with the functions it was made from,
+    so the changed ones are compiled again and the rest come from their files (totk_pipeline_archive.h
+    par_same_identity). The first run takes over the newest chain-named folder of the same kind."""
+    target=folder/('archive'+suffix)
+    if target.exists():return target
+    kind=lambda p:p.name.endswith('-title')==bool(suffix)
+    old=[p for p in folder.iterdir() if p.is_dir() and p.name.startswith('oot-native-') and kind(p) and (p/'pipelines').is_dir()]
+    if old:
+        newest=max(old,key=lambda p:(p/'pipelines').stat().st_mtime)
+        newest.rename(target)
+        print(f'pipeline archive: {target.name} takes over {newest.name} (kept across chains; changed pipelines are compiled again)',flush=True)
+    return target
 
 def compute_pipeline_archive(work, tree, lists, mode='full'):
     """Build every seed compute pipeline and, with them, the render pipelines the App's warm-up lists name (lists: the
@@ -290,20 +309,21 @@ def compute_pipeline_archive(work, tree, lists, mode='full'):
     if scripts not in sys.path:sys.path.insert(0,scripts)
     from prepare_compute_pipelines import compute_rows
     from dev.game_slot import GameSlot
-    seed,_,suffix=shader_dirs(tree,mode)
+    seed,libraries,suffix=shader_dirs(tree,mode)
     rows=compute_rows(seed)
     folder=tree/'build/compute-pipelines';folder.mkdir(parents=True,exist_ok=True)
     plan=folder/'compute.tsv';plan.write_text('\n'.join(rows)+'\n')
     chain=json.loads((seed/'seed-manifest.json').read_text())['chain']
-    # The runtime's archive metadata also checks GPU, OS and chain before reuse.
-    cache=folder/(chain+suffix)   # a title build's own: its pruning never reaches the full build's files
+    cache=pipeline_cache(folder,suffix)   # a title build's own: its pruning never reaches the full build's files
     # Kept from one package to the next, also when the runtime changed: with TOTK_PAR_RECHECK=1 the tool makes every listed
     # pipeline against the archive (Metal compares the functions and state), so one this runtime describes otherwise is
     # compiled and written again and the rest come from their files (nvn_mtl.m mtl_pipeline_archive_tool, par_stale; user
     # 2026-11-11: "如何让 快速更新 不要这么容易失效"). Until then any runtime change threw it away: 17 min for 21,330 pipelines.
     logs=work/'logs';logs.mkdir(exist_ok=True)
     log=logs/'compute-pipelines.log'
-    env=dict(os.environ,TOTK_NATIVE_DIR=str(tree/'build'),TOTK_SHADER_CACHE=str(cache),
+    # TOTK_SHADER_LIBS_DIR: the libraries this App carries (a quick App's shader-libs-title), not TOTK_NATIVE_DIR's
+    # shader-libs, the full build's: Metal finds an archived pipeline only with the very library binary it was made from
+    env=dict(os.environ,TOTK_NATIVE_DIR=str(tree/'build'),TOTK_SHADER_CACHE=str(cache),TOTK_SHADER_LIBS_DIR=str(libraries),
              TOTK_SHADER_SEED_DIR=str(seed),TOTK_PIPELINE_ARCHIVE_HOST='1',TOTK_DEBUG_LOG='1',TOTK_PAR_RECHECK='1')
     lists_sha256={p.name:sha(p) for p in lists}   # check_archive_lists compares them with the files the App carries
     lists=[p for p in lists if p.is_file() and any(l and not l.startswith('#') for l in p.read_text().splitlines())]
@@ -316,6 +336,7 @@ def compute_pipeline_archive(work, tree, lists, mode='full'):
     reports=[json.loads(line) for line in log.read_text().splitlines() if line.startswith('{"render":')]
     if not reports:raise ValueError(f'pipeline archive exit {tool.returncode} without a completion report; see {log}')
     report=reports[-1]
+    check_archive_libraries(report,libraries)
     # A listed render row that cannot be built only misses the warm-up (it is built at its draw); every compute pipeline must be there (the index check below).
     if report['write_failed'] or report['compute']+report['kept']<len(rows) or (report['failed'] and not lists):
         raise ValueError('incomplete pipeline archive: '+str(report))
@@ -340,6 +361,17 @@ RENDER_ROWS=('R\t','B\t','T\t')   # the warm rows that are render pipelines (sha
 MESH_ROWS=('M\t',)                 # mesh pipelines: archived since 2026-11-11 (nvn_mesh_tasks.inc mtk_archive_key)
 MESH_KEY='m'                       # their archive keys ('m' + 40 hex; render keys are hex, compute keys 'c' + hex)
 WARM_LISTS=('pso_title.tsv','pso_manifest.tsv')
+
+def check_archive_libraries(report, libraries):
+    """The pipeline archive must be made from the libraries the App carries: Metal takes an archived pipeline only with the
+    very library binary it was compiled from. 2026-11-15: the packaging tool loaded the full build's libraries for a quick
+    App (494 of its 537 differ in bytes); the game's Metal refused 531 of the 602 archived pipelines ("Unable to find
+    function main0") and compiled them all again before the title (134 s). report: the tool's JSON line, which names the
+    folder it loaded them from (libs). Raises ValueError when it is not this App's."""
+    used=report.get('libs')
+    if not used:raise ValueError('the pipeline archive tool did not name the libraries it built from (libs): rebuild the runtime')
+    if Path(used).resolve()!=Path(libraries).resolve():
+        raise ValueError(f'the pipeline archive was built from the libraries in {used}, not from the ones this App carries ({libraries})')
 
 def check_archive_lists(build):
     """The App's pipeline archive must be built from the warm-up lists the App carries (build/pso_title.tsv,
@@ -425,7 +457,11 @@ def package_app(work,tree,out,game_data_mode='app',game_data_folder=None,shared=
     commit=build_app.source_commit()
     if commit:info['MNGSourceCommit']=commit   # the HUD box and the Update page name the commit the app was built from
     (temporary/'Contents/Info.plist').write_bytes(plistlib.dumps(info));(temporary/'Contents/PkgInfo').write_bytes(b'APPL????')
-    subprocess.run(['codesign','--force','--sign','-',temporary],check=True)
+    # build_app.sign_app: the designated requirement is the bundle ID, so macOS keeps the player's "removable volume"
+    # permission across updates. A plain ad-hoc signature made it this build's code hash: every update asked again, and an
+    # app started with open waited in launcher.m running_game's open() until someone clicked (2026-11-15, TCC.db: oot's
+    # grant was a cdhash, totk / botw / pokopia's an identifier).
+    build_app.sign_app(temporary,work/'logs')
     subprocess.run(['codesign','--verify','--strict',temporary],check=True)
     # The installed .app folder stays and takes the new contents: macOS keeps its first-run check of an app with the folder.
     while app_running(out):time.sleep(5)   # the build may have taken a while: the App is replaced only once it is closed
@@ -666,11 +702,11 @@ def build(args, source):
     run([py,'scripts/prepare_shared_fonts.py','--version','oot'],'prepare-shared-fonts')
     service=tree/'build/shader-service';service.mkdir(parents=True,exist_ok=True)
     binary=GAME/'prebuilt/macos-arm64/totk_xlate'
-    if sha(binary)!=(binary.with_suffix('.sha256')).read_text().strip():raise ValueError('shader translator checksum mismatch')
+    if sha(binary)!=(binary.with_suffix('.sha256')).read_text().split()[0]:raise ValueError('shader translator checksum mismatch')
     temporary_service=service/'totk_xlate.new'
     shutil.copy2(binary,temporary_service);os.replace(temporary_service,service/'totk_xlate')
     proof=GAME/'prebuilt/macos-arm64/oot_write_proof.dylib'
-    if sha(proof)!=proof.with_suffix('.dylib.sha256').read_text().strip():raise ValueError('shader proof analyzer checksum mismatch')
+    if sha(proof)!=proof.with_suffix('.dylib.sha256').read_text().split()[0]:raise ValueError('shader proof analyzer checksum mismatch')
     shutil.copy2(proof,service/proof.name)
     shutil.copy2(proof.with_name('SPIRV-Tools.LICENSE'),service/'SPIRV-Tools.LICENSE')
     (tree/'build/shader-map.tsv').write_text('# TOTK control-code-sha256-v1\n')
