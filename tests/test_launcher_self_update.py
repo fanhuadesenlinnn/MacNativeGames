@@ -109,6 +109,7 @@ class Served(unittest.TestCase):
         """The update as the window runs it, with a "Launcher" that quits a moment later; returns (exit code, events,
         the outcome the replacement wrote or None)."""
         launcher = subprocess.Popen(['/bin/sleep', '0.4'])
+        tidied = self.tidied()
         env = dict(os.environ, MNG_LAUNCHER_UPDATE_NO_OPEN='1', MNG_LANG='en')
         done = subprocess.run([sys.executable, '-B', str(SCRIPT), 'update', '--app', str(app), '--support', str(self.support),
                                '--pid', str(launcher.pid), '--feed', f'{self.base}/releases.json', *extra],
@@ -118,12 +119,25 @@ class Served(unittest.TestCase):
         result = self.support / 'launcher-update/result.json'
         outcome = None
         if wait and done.returncode == 0:
-            for _ in range(200):
-                if result.exists() and result.read_text().strip():
-                    outcome = json.loads(result.read_text())
-                    break
-                time.sleep(0.05)
+            outcome = self.outcome(result, tidied)
         return done.returncode, events, outcome
+
+    def tidied(self):
+        """How often the replacement script has finished its tidying so far (its log's last word each time)."""
+        log = self.support / 'launcher-update/replace.log'
+        return log.read_text().count('tidied') if log.exists() else 0
+
+    def outcome(self, result, tidied):
+        """What the script wrote for the next start, read once it has also removed the old copy: the outcome is written
+        (and the new Launcher opened) before that, so a player does not wait for hundreds of MB to be deleted."""
+        found = None
+        for _ in range(1200):
+            if found is None and result.exists() and result.read_text().strip():
+                found = json.loads(result.read_text())
+            if found is not None and (self.tidied() > tidied or found.get('why') in ('missing', 'aside', 'running')):
+                return found
+            time.sleep(0.05)
+        return found
 
     def leftovers(self):
         return sorted(p.name for p in self.apps.iterdir() if p.name != APP) + sorted(
@@ -267,14 +281,13 @@ class Replacement(Served):
     def script(self, pid, new, app):
         base = self.support / 'launcher-update'
         base.mkdir(parents=True, exist_ok=True)
+        tidied = self.tidied()
         with mock.patch.dict(os.environ, {'MNG_LAUNCHER_UPDATE_NO_OPEN': '1'}):
             lu.start_replacement(base, pid, new, app)
-        result = base / 'result.json'
-        for _ in range(200):
-            if result.exists() and result.read_text().strip():
-                return json.loads(result.read_text())
-            time.sleep(0.05)
-        self.fail('the replacement wrote no outcome: ' + (base / 'replace.log').read_text())
+        found = self.outcome(base / 'result.json', tidied)
+        if found is None:
+            self.fail('the replacement wrote no outcome: ' + (base / 'replace.log').read_text())
+        return found
 
     def quit_launcher(self):
         p = subprocess.Popen(['/bin/sleep', '0.2'])
@@ -290,6 +303,54 @@ class Replacement(Served):
         self.assertEqual(self.script(launcher.pid, new, running), {'ok': True})
         self.assertGreater(time.time() - started, 1.3)
         self.assertEqual(version_of(running), '1.0.7')
+
+    def test_nothing_is_left_beside_the_app_when_the_support_folder_is_on_another_disk(self):
+        # the new app is then unpacked into a hidden folder beside the app (work_folder); 1.0.7 left that folder there,
+        # empty, after every update (seen in /Applications with the support folder on an external disk)
+        running = make_app(self.apps, '1.0.6', self.program)
+        base = self.support / 'launcher-update'
+        base.mkdir(parents=True)
+        real = os.stat
+
+        def other_disk(path, *a, **kw):
+            st = real(path, *a, **kw)
+            return os.stat_result((*st[:2], st.st_dev + 1, *st[3:])) if Path(path) == self.apps else st
+
+        with mock.patch.object(lu.os, 'stat', other_disk):
+            self.assertEqual(lu.work_folder(self.support, running), (base, self.apps / '.MNG Launcher update'))
+        with mock.patch.object(lu.os, 'stat', real):
+            self.assertEqual(lu.work_folder(self.support, running), (base, base))
+        stage = self.apps / '.MNG Launcher update' / 'new'
+        new = make_app(stage, '1.0.7', self.program)
+        self.assertEqual(self.script(self.quit_launcher(), new, running), {'ok': True})
+        self.assertEqual(version_of(running), '1.0.7')
+        self.assertEqual([p.name for p in self.apps.iterdir()], [APP])
+        self.assertTrue((base / 'replace.sh').is_file())             # the support folder is left as it is
+
+    def test_the_reopened_launcher_does_not_get_the_tests_switches(self):
+        # `open` hands the script's environment to the app it starts, and the script's came from the Launcher that was
+        # replaced: 1.0.7, started with MNG_LAUNCHER_UPDATE_TEST for its release check, reopened with it every time
+        # ("1.0.7 为什么 一直可以更新 下载"). What the script would run is run here with a stand-in for `open`.
+        self.assertEqual(lu.REPLACE.count('/usr/bin/open'), 1)       # the one place the Launcher is opened from
+        start = lu.REPLACE.index('/usr/bin/env -u MNG_LAUNCHER_UPDATE_TEST')
+        command = lu.REPLACE[start:lu.REPLACE.index('\n', lu.REPLACE.index('/usr/bin/open', start))]
+        self.assertIn('/usr/bin/open -n "$app"', command)
+        seen = self.made / 'environment.txt'
+        stand_in = f'/usr/bin/env >"{seen}"; :'
+        script = 'app=x; ' + command.replace('/usr/bin/open -n "$app"', '/bin/sh -c \'' + stand_in + '\'').replace('\\\n', ' ')
+        env = dict(os.environ, MNG_LAUNCHER_UPDATE_TEST='1', MNG_LAUNCHER_UPDATE_CLICK='1', MNG_LANG='zh',
+                   PYTHONDONTWRITEBYTECODE='1', MNG_KEPT='yes')
+        subprocess.run(['/bin/sh', '-c', script], check=True, env=env)
+        names = {l.split('=', 1)[0] for l in seen.read_text().splitlines()}
+        self.assertFalse(names & {'MNG_LAUNCHER_UPDATE_TEST', 'MNG_LAUNCHER_UPDATE_CLICK', 'MNG_LANG', 'PYTHONDONTWRITEBYTECODE'})
+        self.assertTrue({'MNG_KEPT', 'HOME'} <= names)               # the rest of the environment is as it was
+
+    def test_the_new_launcher_opens_before_the_old_copy_is_removed(self):
+        # removing the old app (hundreds of MB) took more than ten seconds on a busy Mac: the outcome is written and the
+        # new Launcher opened first, the old copy removed behind it
+        swapped = lu.REPLACE[lu.REPLACE.index('if mv "$new" "$app"; then'):]
+        self.assertLess(swapped.index("report '{\"ok\": true}'"), swapped.index('rm -rf "$old"'))
+        self.assertLess(swapped.index('rm -rf "$old"'), swapped.index('echo "tidied"'))
 
     def test_a_missing_new_app_leaves_the_old_one(self):
         running = make_app(self.apps, '1.0.6', self.program)

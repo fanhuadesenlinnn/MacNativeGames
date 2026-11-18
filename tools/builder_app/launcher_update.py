@@ -56,10 +56,17 @@ REPLACE = r'''#!/bin/sh
 pid=$1; new=$2; app=$3; result=$4; log=$5
 exec >>"$log" 2>&1
 echo "$(date '+%Y-%m-%d %H:%M:%S') replacing $app with $new once pid $pid has quit"
-finish() {
+report() {
   printf '%s\n' "$1" >"$result"
-  # -n: this app at this place, also while another copy of MNG Launcher is open from somewhere else
-  [ "${MNG_LAUNCHER_UPDATE_NO_OPEN:-0}" = 1 ] || /usr/bin/open -n "$app"
+  # -n: this app at this place, also while another copy of MNG Launcher is open from somewhere else.
+  # The app `open` starts gets this script's environment, which came from the Launcher that was replaced: the tests'
+  # switches and what the window set for its Python must not go on into the new one (2026-11-18: a 1.0.7 started with
+  # MNG_LAUNCHER_UPDATE_TEST for the release check reopened with it every time, so its update button never went away).
+  [ "${MNG_LAUNCHER_UPDATE_NO_OPEN:-0}" = 1 ] || /usr/bin/env -u MNG_LAUNCHER_UPDATE_TEST -u MNG_LAUNCHER_UPDATE_CLICK \
+    -u MNG_LANG -u PYTHONDONTWRITEBYTECODE /usr/bin/open -n "$app"
+}
+finish() {
+  report "$1"
   exit "$2"
 }
 n=0
@@ -78,15 +85,29 @@ if ! mv "$app" "$old"; then
   echo "the old app could not be moved aside: nothing was replaced"
   finish '{"ok": false, "why": "aside"}' 1
 fi
+# The folder the new app was unpacked into, and the one around it when that is a hidden folder of its own beside the app
+# (the support folder on another disk than the app; 1.0.7 left it there, empty, after every update). The support folder
+# itself holds this script and its log and is never empty, so rmdir leaves it.
+tidy() {
+  stage=$(dirname "$new")
+  rm -rf "$new"
+  rmdir "$stage" 2>/dev/null
+  rmdir "$(dirname "$stage")" 2>/dev/null
+}
 if mv "$new" "$app"; then
   echo "replaced"
+  report '{"ok": true}'   # the new Launcher opens now; the old copy (hundreds of MB) is removed behind it
   rm -rf "$old"
-  rmdir "$(dirname "$new")" 2>/dev/null   # the folder the new app was unpacked into, now empty
-  finish '{"ok": true}' 0
+  tidy
+  echo "tidied"
+  exit 0
 fi
 echo "the new app could not be put in place: the old one is back"
 mv "$old" "$app"
-finish '{"ok": false, "why": "place"}' 1
+report '{"ok": false, "why": "place"}'
+tidy
+echo "tidied"
+exit 1
 '''
 
 
