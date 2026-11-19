@@ -258,6 +258,24 @@ def c1_list(tree,mode='full'):
     print(f'   c1 list: {rows} shaders proven'+(' (seed unchanged, kept)' if kept else ''),flush=True)
     return out
 
+def pool_list(work,tree,mode='full'):
+    """build/pool_sources<suffix>.tsv: the pool proof (nvn_pool_sources.m) of every seed shader with a pooled read, made
+    once here by the runtime's own code (tools/pool_sources_list.m, built with the runtime) instead of at every load
+    (2026-11-18, user: "a"): one 200 KB shader took 40-70 ms, 99.6 s over the 40,659 translations, at every start's
+    warm-up and at the first load in play. Made again only when the seed manifest or nvn_pool_sources.m changes (the
+    first line names both). Every row is decoded again before the list is written (--verify)."""
+    seed,_,suffix=shader_dirs(tree,mode)
+    out=tree/f'build/pool_sources{suffix}.tsv'
+    seed_sha,scan_sha=sha(seed/'seed-manifest.json'),sha(GAME/'third_party/d2r_gfx/gfx/nvn/nvn_pool_sources.m')
+    if out.is_file():
+        with out.open() as f:
+            if f.readline().rstrip('\n')==f'# nvn pool sources v1 seed={seed_sha} scan={scan_sha}':
+                print('   pool sources: seed and proof unchanged, kept',flush=True);return out
+    tool=work/'build/pool-sources-list'
+    if not tool.is_file():raise ValueError(f'{tool} is missing: the runtime build makes it (make -C games/oot)')
+    subprocess.run([str(tool),str(seed),str(out),seed_sha,scan_sha,'--verify'],check=True)
+    return out
+
 # The bundle's shaders as image parts (shader-seed.img.NNN, shader-libs.img.NNN beside the two folders, at most
 # IMAGE_PART bytes each; ios/tools/seed_image.py, read in place by totk_seed_image.h), not 128,674 seed files and 64,699
 # libraries (2026-11-17, user: "继续做吧"): from the USB drive the App is on, a library first used in play cost an
@@ -501,6 +519,8 @@ def package_app(work,tree,out,game_data_mode='app',game_data_folder=None,shared=
     took('warm-up lists resolved')
     c1=c1_list(tree,mode) if shader_record else None
     took('c1 list')
+    pools=pool_list(work,tree,mode) if shader_record else None
+    took('pool sources')
     pipelines=compute_pipeline_archive(work,tree,lists,mode) if shader_record else None
     took('pipeline archive')
     prepared=shader_bundle(tree,shader_record,mode) if shader_record else None
@@ -556,6 +576,7 @@ def package_app(work,tree,out,game_data_mode='app',game_data_folder=None,shared=
     title,manifest=lists   # the archive's lists, beside the shader map, where the runtime and the launcher look (build_app.py resolve_lists)
     clone_file(title,data/'build/pso_title.tsv');clone_file(manifest,data/'build/pso_manifest.tsv')
     if c1:clone_file(c1,data/'build/c1_bounded.tsv')   # beside the shader map, where nvn_mtl.m c1_bounded_load reads it
+    if pools:clone_file(pools,data/'build/pool_sources.tsv')   # beside it too: nvn_mtl.m pool_list_load
     if pipelines:check_archive_lists(data/'build')   # never an App whose archive was built from other lists
     took('App assembled')
     # VideoToolbox is the primary AV1 decoder; the bounded dav1d fallback is linked statically (build_app.codec_libraries
@@ -622,6 +643,27 @@ def app_running(app):
         return True
     return False
 
+def seed_context_matches(tree,metadata):
+    """The seed (its seed-manifest.json `metadata`) was translated in this repository's translation context: the same chain,
+    depth mode and translator code (prepare_ns2_seed.translation_context, schema 4 since 2026-11-18). A seed from before
+    names its context by the translator's whole file (schema 3): it still matches when a program it names (the work
+    tree's in-game translator, its prebuilt copy or a translation cache's own copy, by whole-file SHA-256) has this
+    repository's translator's code and gives that context. So the Launcher's Developer ID copy and this repository's
+    ad-hoc one are one translator (user 2026-11-18: an express update after the Launcher's build was refused)."""
+    scripts=str(GAME/'scripts')
+    if scripts not in sys.path:sys.path.insert(0,scripts)
+    from prepare_ns2_seed import translation_context,legacy_translation_context,code_sha256
+    repo=GAME/'prebuilt/macos-arm64/totk_xlate';depth=metadata.get('nvn_depth_mode');have=metadata.get('translation_context_sha256')
+    if have==translation_context(repo,depth):return True
+    named=metadata.get('translator_sha256');code=code_sha256(repo)
+    cache=tree/'build/ns2-seed-cache/oot'
+    places=[tree/'build/shader-service/totk_xlate',tree/'prebuilt/macos-arm64/totk_xlate',
+            *(sorted(cache.glob('*/tool/build/shader-service/totk_xlate')) if cache.is_dir() else [])]
+    for program in places:
+        if program.is_file() and sha(program)==named and code_sha256(program)==code and legacy_translation_context(program,depth)==have:
+            return True
+    return False
+
 def update_blocker(work, mode='full', remake=False):
     """Why this work folder cannot take an update without the full build ('' when it can): its last full build's files
     are missing, its shaders are of another translation chain or translator than this repository's (the seed's
@@ -641,10 +683,9 @@ def update_blocker(work, mode='full', remake=False):
     if mode!='title' and not remake:
         scripts=str(GAME/'scripts')
         if scripts not in sys.path:sys.path.insert(0,scripts)
-        from prepare_ns2_seed import translation_context
         try:metadata=json.loads(manifest.read_text())
         except ValueError:return f'{manifest} is not readable: run the full build'
-        if metadata.get('translation_context_sha256')!=translation_context(GAME/'prebuilt/macos-arm64/totk_xlate',metadata.get('nvn_depth_mode')):
+        if not seed_context_matches(tree,metadata):
             return 'the translation chain or the translator changed, or the seed is older than the request checks (2026-11-11): the shaders need the full build'
     expected=json.loads((GAME/'assets/expected-v131072.json').read_text())
     for name,want in expected['rewritten_sha256'].items():
@@ -701,11 +742,8 @@ def update_shaders(app,listfile,work=None):
     manifest=shader_dirs(tree,shader_mode(app))[0]/'seed-manifest.json'
     for needed in (manifest,tree/'extracted/oot/romfs/index.json',work/'build/oot-native'):
         if not needed.exists():raise ValueError(f'{needed} is missing: the work folder cannot translate shaders (a full build makes it)')
-    scripts=str(GAME/'scripts')
-    if scripts not in sys.path:sys.path.insert(0,scripts)
-    from prepare_ns2_seed import translation_context
     metadata=json.loads(manifest.read_text())
-    if metadata.get('translation_context_sha256')!=translation_context(GAME/'prebuilt/macos-arm64/totk_xlate',metadata.get('nvn_depth_mode')):
+    if not seed_context_matches(tree,metadata):
         raise ValueError('this repository translates for another chain or translator than the App\'s shaders: update the App first')
     told=False
     while app_running(app):
