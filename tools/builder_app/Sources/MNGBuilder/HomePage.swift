@@ -11,14 +11,23 @@ struct HomePage: View {
     @State private var defaulted = false   // the first built game was chosen once, when the page first showed
     @State private var gamePage: String?   // the page a case's back opened (T.gamePages), shown under the Cover Flow
     @State private var launches = 0        // games started from a back: the Cover Flow grows the case over the stage
+    /// How the middle case opens (user 2026-11-19: "盒子 翻转 改成 盒子 打开", "旧方案 保留 可以切换"): book (its cover swings
+    /// open, the default) or turn (the whole case turns over, as before); MNG Launcher › Settings… (UsageStatsSettings).
+    @AppStorage(CaseOpening.key) private var caseOpening = CaseOpening.book.rawValue
+    /// The stage's animations this many times slower, to watch them (user 2026-11-19: "右下角 放一个按钮 叫 慢速模式 可以
+    /// 选择 慢1 2 3 5 10 20 50倍 我要看动画效果"); for this run only, so it is never left slow by mistake.
+    @State private var slowMotion = 1
+    static let slowMotions = [1, 2, 3, 5, 10, 20, 50]
 
-    static let games = ["oot", "totk", "botw", "eow", "odyssey", "acnh", "dkb", "pkp"]
+    static let games = GameCatalog.all
 
-    /// The cases' order (user 2026-11-17: "已经安装的游戏 放前面，没有安装的游戏盒子 放后面"): the built games, then the
-    /// ones not built yet, each in the catalog's order.
-    private var order: [String] {
-        let built = Self.games.filter { g in model.installed.contains { $0.game == g } }
-        return built + Self.games.filter { !built.contains($0) }
+    /// The cases' order: the catalog's, the same as the iPhone's (user 2026-11-19: "顺序也一样"; until then the built
+    /// games came first, user 2026-11-17, which put the cases in a different order on each device).
+    private var order: [String] { Self.games }
+    @ObservedObject private var official = OfficialCovers.shared   // a fetched picture changes picturePaths
+    /// Each case's picture, in the cases' order (the ones it has).
+    private var picturePaths: [String] {
+        order.compactMap { g in GameCard.coverPath(g, model.installed.first { $0.game == g }) }
     }
     private var selected: String { order.contains(chosen) ? chosen : order[0] }
     private var center: Binding<Int> {
@@ -73,7 +82,16 @@ struct HomePage: View {
                 // The games as the iPod classic's Cover Flow (user 2026-11-17): every one is reached by the arrows,
                 // the arrow keys, a drag or a click on a side cover, at any window width
                 let cases = order
-                CoverFlow(count: cases.count, index: center, launches: launches, name: { T.gameName(cases[$0]) }) { i in
+                // no arrow buttons (user 2026-11-19: "mac 左右箭头去掉"): the arrow keys, a drag, a click on a side case
+                // and the trackpad's swipe move the cases
+                CoverFlow(count: cases.count, index: center, launches: launches, name: { T.gameName(cases[$0]) },
+                          arrows: false, opening: CaseOpening(rawValue: caseOpening) ?? .book,
+                          inside: { i in
+                              let game = cases[i]
+                              return CoverImages.shared.cover(at: GameCard.coverPath(game, model.installed.first { $0.game == game }))?.picture
+                          },
+                          cartridge: { i in model.installed.contains { $0.game == cases[i] } },   // built: its cartridge
+                          slow: Double(slowMotion)) { i in
                     let game = cases[i]
                     GameCard(game: game, app: model.installed.first { $0.game == game }, loading: !model.installedLoaded,
                              selected: false, cover: true, tap: {})
@@ -98,17 +116,28 @@ struct HomePage: View {
                         EmptyBack(ready: model.installedLoaded, live: live, wide: true, name: T.gameName(game)) { open(game) }
                     }
                 }
-                // what the middle cover is, as the iPod writes it under the cover
-                VStack(spacing: 4) {
-                    Text(T.gameName(selected)).font(.title2.weight(.semibold))
-                    Text(T.gamePlatforms(selected)).font(.callout).foregroundStyle(.secondary)
-                    if model.installedLoaded, !model.installed.contains(where: { $0.game == selected }) {
-                        Button { open(selected) } label: { Label(T.addGame, systemImage: "plus") }
-                            .buttonStyle(.borderedProminent).controlSize(.large).padding(.top, 6)
-                            .help(T.addGameHelp(T.gameName(selected)))
+                .overlay(alignment: .bottomTrailing) {   // 慢速模式, the stage's bottom-right corner
+                    // a Launcher built here only, never the release players get (user 2026-11-19: "龟速模式 按钮 只能我
+                    // 开发版 看到 用户 不能看到")
+                    if !Paths.isRelease {
+                    Menu {
+                        Picker(T.slowMotion, selection: $slowMotion) {
+                            ForEach(Self.slowMotions, id: \.self) { n in Text(T.slowMotionTimes(n)).tag(n) }
+                        }
+                        .pickerStyle(.inline)
+                    } label: {
+                        Label(slowMotion == 1 ? T.slowMotion : "\(T.slowMotion) ×\(slowMotion)", systemImage: "tortoise")
+                    }
+                    .menuStyle(.borderlessButton).fixedSize()
+                    .padding(.horizontal, 10).padding(.vertical, 5)
+                    .background(.black.opacity(0.45), in: Capsule())
+                    .foregroundStyle(.white)
+                    .environment(\.colorScheme, .dark)
+                    .padding(12)
                     }
                 }
-                .frame(maxWidth: .infinity)
+                // nothing under the stage: no name nor platforms (user 2026-11-19: "去掉 下面这个说明"), no add button
+                // ("这个按钮 去掉 不是盒子里的": the opened case has its own)
                 if let error = model.installedError {
                     Label(T.appsScanFailed(error), systemImage: "exclamationmark.triangle").foregroundStyle(.orange)
                         .textSelection(.enabled)
@@ -155,6 +184,19 @@ struct HomePage: View {
         .onAppear(perform: chooseFirst)
         .onChange(of: selected) { gamePage = nil }   // another game in the middle: its own pages start closed
         .onChange(of: model.installed) { chooseFirst() }
+        // every built game's switches read before its case opens (GameCardState.preload): the middle case's first
+        .task(id: model.installed.map(\.app)) {
+            let middle = model.installed.first { $0.game == selected }.map { [$0.app] } ?? []
+            await GameCardState.preload(middle + model.installed.map(\.app))
+        }
+        .task(id: selected) {
+            if let app = model.installed.first(where: { $0.game == selected })?.app { await GameCardState.preload([app]) }
+        }
+        // every case's depth made ahead, the middle one first (user 2026-11-19: "不能都提前准备好吗？"); again when a
+        // picture changes (an official one fetched, a game built)
+        .task(id: picturePaths) {
+            DepthScenes.shared.prepare(DepthScenes.outwards(picturePaths, from: order.firstIndex(of: selected) ?? 0))
+        }
         .onChange(of: model.installedLoaded) { chooseFirst() }
     }
 }
@@ -168,65 +210,53 @@ struct GameCard: View {
     var cover = false
     let tap: () -> Void
 
-    @ObservedObject var crops = CoverCrops.shared   // not private: the memberwise init stays usable
+    @ObservedObject var official = OfficialCovers.shared   // a picture fetched on this Mac shows when it arrives
+                                                           // (not private: the memberwise init stays usable)
 
-    private var picturePath: String? {
+    /// The icon file of each app, read from its Info.plist once (again when the Info.plist changes): a case is drawn on
+    /// every frame of a swipe (user 2026-11-19, "mac 也要这样优化吗" "改").
+    @MainActor private static var iconPaths: [String: (stamp: Date?, path: String)] = [:]
+
+    private var picturePath: String? { Self.coverPath(game, app) }
+
+    /// The case's picture: the game's official key art (OfficialCovers; built or not), else its app's icon.
+    @MainActor static func coverPath(_ game: String, _ app: InstalledReport.App?) -> String? {
+        OfficialCovers.shared.path(for: game) ?? picturePath(of: app)
+    }
+
+    /// The icon file of a built game's app (the opened case's inside shows it too: HomePage, CaseDetail's `inside`).
+    static func picturePath(of app: InstalledReport.App?) -> String? {
         guard let app else { return nil }
         // the icon the app's Info.plist names (Odyssey: OdysseyIcon, Animal Crossing: AnimalCrossingIcon), else AppIcon
         // (2026-11-18: Odyssey's case showed no picture, the Launcher looked only for AppIcon.icns)
         let bundle = URL(fileURLWithPath: app.app)
-        let info = NSDictionary(contentsOf: bundle.appendingPathComponent("Contents/Info.plist"))
+        let plist = bundle.appendingPathComponent("Contents/Info.plist")
+        let stamp = (try? FileManager.default.attributesOfItem(atPath: plist.path))?[.modificationDate] as? Date
+        if let known = Self.iconPaths[app.app], known.stamp == stamp { return known.path }
+        let info = NSDictionary(contentsOf: plist)
         let name = (info?["CFBundleIconFile"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "AppIcon"
         let file = (name as NSString).pathExtension.isEmpty ? name + ".icns" : name
-        return bundle.appendingPathComponent("Contents/Resources").appendingPathComponent(file).path
+        let path = bundle.appendingPathComponent("Contents/Resources").appendingPathComponent(file).path
+        Self.iconPaths[app.app] = (stamp, path)
+        return path
     }
 
-    private var picture: NSImage? { picturePath.flatMap { NSImage(contentsOfFile: $0) } }
+    /// The picture decoded once and its blurred backdrop made once (CoverArt.swift CoverImages, shared with the iPhone).
+    private var art: CoverImages.Cover? { CoverImages.shared.cover(at: picturePath) }
+    private var picture: NSImage? { art?.picture }
 
     var body: some View {
         if cover { coverBody } else { cardBody }
     }
 
-    /// The picture on a case's front in the Cover Flow (CoverFlow handles the clicks: it knows which case is where).
+    /// The picture on a case's front in the Cover Flow (CoverFlow handles the clicks: it knows which case is where); the
+    /// front itself is CoverArt.swift's CoverFront, shared with the iPhone / iPad Launcher.
     private var coverBody: some View {
-        // as a real case (user 2026-11-17, a Switch 2 case): the red band across the top, the insert's picture under it
-        GeometryReader { geo in
-            let band = geo.size.height * CaseHeader.share
-            VStack(spacing: 0) {
-                CaseHeader(game: game).frame(height: band)
-                coverArt.frame(width: geo.size.width, height: geo.size.height - band).clipped()
-            }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)   // the case's front (CoverFlow sizes it)
-        .clipped()
-    }
-
-    /// The insert under the band: the game's square picture cut to a tall rectangle round its title (CoverCrops), its
-    /// lower edge fading into the same picture lightly blurred, which carries on to the bottom with the game's name.
-    private var coverArt: some View {
-        ZStack {
-            if let picture, let picturePath {
-                GeometryReader { geo in
-                    let tall = min(geo.size.height, geo.size.width / CoverCrops.keep)
-                    ZStack(alignment: .top) {
-                        Image(nsImage: picture).resizable().scaledToFill()
-                            .frame(width: geo.size.width, height: geo.size.height).blur(radius: 10).clipped()
-                            .overlay(Color.black.opacity(0.25))
-                        CroppedPicture(picture: picture, center: crops.center(of: picturePath))
-                            .frame(width: geo.size.width, height: tall)
-                            .mask(LinearGradient(stops: [.init(color: .black, location: 0.88), .init(color: .clear, location: 1)],
-                                                 startPoint: .top, endPoint: .bottom))
-                        VStack {
-                            Spacer(minLength: 0)
-                            Text(T.gameName(game)).font(.system(size: geo.size.width * 0.075, weight: .bold))
-                                .foregroundStyle(.white).multilineTextAlignment(.center).lineLimit(2).minimumScaleFactor(0.6)
-                                .padding(.horizontal, geo.size.width * 0.06).shadow(color: .black.opacity(0.6), radius: 3)
-                                .frame(height: max(0, geo.size.height - tall * 0.96))
-                        }
-                    }
-                }
-            } else {
-                LinearGradient(colors: T.gameColors(game), startPoint: .topLeading, endPoint: .bottomTrailing)
+        let art = art
+        // cut where covers.json says across the official picture; an app's icon in the middle
+        let center = official.path(for: game) != nil ? official.center(for: game) : 0.5
+        return CoverFront(game: game, picture: art?.picture, picturePath: art?.path, center: center) {
+            ZStack {
                 if loading {
                     ProgressView().controlSize(.small).tint(.white)
                 } else {
@@ -312,7 +342,35 @@ struct GameCard: View {
     @Published var saver: GameActions.MemorySaver?         // 开启省内存模式 (tools/builder_jobs/memory_saver.py)
     @Published var diagnostics: GameActions.MemorySaver?   // 诊断模式 (the same module, its 'diagnostics' switch)
     @Published var saverNote = ""
-    var asked = false   // the switches were asked for: the first back drawn (as the case starts turning) asks once
+    private(set) var loaded = false   // the switches were read once
+    private var loading: Task<Void, Never>?
+
+    /// Reads the card's switches (tools/builder_jobs memory_saver.py; one Python process each), one read at a time.
+    /// Done before the case opens (preload): user 2026-11-19, "mac 第一次打开 这些按钮在动 而且卡，第二次 就好了": read
+    /// as the case opened, the two processes ran during the opening animation and the switches appeared when they
+    /// answered, pushing the buttons under them down.
+    func loadSwitches(_ app: String) async {
+        if let loading { await loading.value; return }
+        let task = Task { @MainActor in
+            do {
+                saver = try await TabClient.decode(GameActions.MemorySaver.self, "storage", "memory_saver", app: app)
+                diagnostics = try await TabClient.decode(GameActions.MemorySaver.self, "storage", "diagnostics", app: app)
+                saverNote = ""
+            } catch { saverNote = error.localizedDescription }
+            loaded = true
+        }
+        loading = task
+        await task.value
+        loading = nil
+    }
+
+    /// The switches of these apps, read one after the other in the background (the home page, once the list is there,
+    /// and the case that comes to the middle), so every case opens with its buttons where they stay.
+    static func preload(_ apps: [String]) async {
+        for app in apps where !of(app).loaded {
+            await of(app).loadSwitches(app)
+        }
+    }
 }
 
 /// A built game's actions, on its case's back (scheme A): start, the switches, its update, the shader check, and the
@@ -329,9 +387,12 @@ struct GameActions: View {
     /// Laid out for the case opened over the stage (CaseDetail): the game's name and platforms on top, larger type and
     /// controls, the pages in one row; on the case's back (false) small, in one narrow column.
     let wide: Bool
-    /// The big buttons' width: opened, 200 points (user 2026-11-17: "按钮 不要 无限长 … 200px就行"), at the left like the
-    /// text ("极速更新 不要居中了"; the start alone sits bottom right); on the narrow back, its whole width.
-    private var buttonWidth: CGFloat { wide ? 200 : .infinity }
+    /// Every button the column's whole width, so their edges line up (user 2026-11-19: "按钮 居然 不整齐 不居中", in the
+    /// opened case's tray, one case wide): opened, the column is at most `column` wide (user 2026-11-17: "按钮 不要 无限长"),
+    /// at the left like the text ("极速更新 不要居中了"; the start alone sits bottom right, as wide); on the narrow back,
+    /// its whole width.
+    private var buttonWidth: CGFloat { .infinity }
+    static let column: CGFloat = 300
 
     init(app: InstalledReport.App, section: Binding<String?>, live: Bool, wide: Bool = false, started: @escaping () -> Void = {}) {
         self.app = app
@@ -355,17 +416,15 @@ struct GameActions: View {
     /// A card switch's state (memory_saver.py state): the game reads its file at its next start.
     struct MemorySaver: Decodable { let available: Bool; let on: Bool; let file: String; let unknown_word: String? }
 
-    /// The switches, as the game will read them at its next start (their files next to its controls.txt): read as soon
-    /// as the case starts turning (the first back drawn), so they are there when the live back is laid on; the live back
-    /// reads them again.
+    /// The switches, as the game will read them at its next start (their files next to its controls.txt): normally read
+    /// before the case opens (GameCardState.preload); read now if not yet. The opened case reads them again once its
+    /// opening animation is over (a switch may have changed elsewhere): no process during the animation, nothing moves.
     private func loadSaver() async {
-        guard live || !state.asked else { return }
-        state.asked = true
-        do {
-            saver = try await TabClient.decode(MemorySaver.self, "storage", "memory_saver", app: app.app)
-            diagnostics = try await TabClient.decode(MemorySaver.self, "storage", "diagnostics", app: app.app)
-            saverNote = ""
-        } catch { saverNote = error.localizedDescription }
+        if !state.loaded { await state.loadSwitches(app.app); return }
+        guard live else { return }
+        try? await Task.sleep(for: .milliseconds(800))
+        guard !Task.isCancelled else { return }
+        await state.loadSwitches(app.app)
     }
     private func setSaver(_ on: Bool) {
         Task {
@@ -412,6 +471,7 @@ struct GameActions: View {
             Label(T.startGame, systemImage: "play.fill").font((wide ? Font.title3 : .callout).weight(.semibold))
                 .frame(maxWidth: buttonWidth).padding(.vertical, wide ? 4 : 0)
         }
+        .frame(maxWidth: wide ? Self.column : .infinity)
         .buttonStyle(.borderedProminent).tint(.green).controlSize(.large)
         .disabled(starting || (model.jobRunning && model.updating == app.app))
         .keyboardShortcut(live ? KeyboardShortcut.defaultAction : nil)
@@ -430,7 +490,10 @@ struct GameActions: View {
             }
         }
         .task {
-            guard live, startsWithSettings else { return }
+            // read once, after the opening animation (a Python process; only the start uses it)
+            guard live, startsWithSettings, gpu == "checking" else { return }
+            try? await Task.sleep(for: .milliseconds(800))
+            guard !Task.isCancelled else { return }
             struct Probe: Decodable { let gpu: String }
             gpu = (try? await TabClient.decode(Probe.self, "settings", "probe", app: app.app).gpu) ?? "unknown"
         }
@@ -494,7 +557,8 @@ struct GameActions: View {
                 }
                 if Model.shaderGames.contains(app.game ?? "") {   // only the shaders and pipelines, from the newest list (user 2026-11-13)
                     HStack(spacing: 6) {
-                        Button(T.checkShaders) { Task { await checkShaders() } }.disabled(checkingShaders || busy)
+                        Button { Task { await checkShaders() } } label: { Text(T.checkShaders).frame(maxWidth: buttonWidth) }
+                            .disabled(checkingShaders || busy)
                         if shaderUpdate {
                             Button(T.updateShaders) { shaderUpdate = false; shaderLine = ""; model.updateShaders(app) }
                                 .buttonStyle(.borderedProminent).disabled(busy)
@@ -505,20 +569,23 @@ struct GameActions: View {
                     if !said.isEmpty { Text(said).font(.caption2).foregroundStyle(.secondary) }
                 }
                 if model.pageApps.contains(where: { $0.app == app.app }) {   // the pages serve these games only
-                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 5), count: wide ? 6 : 3), spacing: wide ? 8 : 5) {
+                    // three a row: the opened case's tray is one case wide (user 2026-11-19, "快…" cut off in six)
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 5), count: 3), spacing: wide ? 8 : 5) {
                         ForEach(T.gamePages.filter { Model.pages(app.game).contains($0.0) }, id: \.0) { id, label in
                             // under the Cover Flow, not a page of its own (user 2026-11-12); pressed again, it closes
                             Button { section = section == id ? nil : id } label: { Text(label).frame(maxWidth: .infinity) }
                                 .buttonStyle(.bordered).tint(section == id ? .accentColor : nil)
                         }
                         if Model.quickGames.contains(app.game ?? "") {   // 快速启动, after the game's pages (user 2026-11-15)
-                            Button(T.quickStart) { model.quickStart(app) }.buttonStyle(.bordered).help(T.quickStartHelp)
+                            Button { model.quickStart(app) } label: { Text(T.quickStart).frame(maxWidth: .infinity) }
+                                .buttonStyle(.bordered).help(T.quickStartHelp)
                                 .disabled(model.phase == .building || model.phase == .cancelling)
                         }
                     }
                 }
             }
             .controlSize(wide ? .regular : .small)
+            .frame(maxWidth: wide ? Self.column : .infinity, alignment: .leading)   // one column, every button as wide
             .frame(maxWidth: .infinity, alignment: .leading)
     }
 

@@ -92,9 +92,11 @@ class Pages(unittest.TestCase):
         # the games as the iPod classic's Cover Flow (user 2026-11-17): a mouse wheel scrolls the page, so every cover is
         # reached by the arrows, the arrow keys and a drag, whatever the window's width
         home = (REPO / 'tools/builder_app/Sources/MNGBuilder/HomePage.swift').read_text()
-        self.assertIn('CoverFlow(count: cases.count, index: center, launches: launches, name: { T.gameName(cases[$0]) })', home)
-        # the built games first, then the ones not built yet (user 2026-11-17); the chosen one is kept by game, not place
-        self.assertIn('return built + Self.games.filter { !built.contains($0) }', home)
+        self.assertIn('CoverFlow(count: cases.count, index: center, launches: launches, name: { T.gameName(cases[$0]) },\n'
+                      '                          arrows: false, opening: CaseOpening(rawValue: caseOpening) ?? .book,', home)
+        # the shared catalog's order, the same as the iPhone's (user 2026-11-19: "顺序也一样"; replacing 2026-11-17's
+        # built games first); the chosen one is kept by game, not place
+        self.assertIn('private var order: [String] { Self.games }', home)
         self.assertIn('let cases = order', home)
         self.assertIn('set: { chosen = order[$0] }', home)
         flow =(REPO / 'tools/builder_app/Sources/MNGBuilder/CoverFlow.swift').read_text()
@@ -108,7 +110,7 @@ class Pages(unittest.TestCase):
         flow = (REPO / 'tools/builder_app/Sources/MNGBuilder/CoverFlow.swift').read_text()
         # a click presses the middle case in (user 2026-11-18: "点击的时候 再来一下 感觉点击上了的效果"); a drag lets
         # the press go
-        for part in ('withAnimation(pressDown) { press = 1 }', 'dampingFraction: 0.42)) { press = 0 }',
+        for part in ('withAnimation(pressDown) { press = 1 }', 'dampingFraction: 0.42))) { press = 0 }',
                      'lean(at: nil, nil); release()',
                      'let pressed = i == center ? CGFloat(press) * w * 0.1 : 0'):
             self.assertIn(part, flow)
@@ -121,7 +123,7 @@ class Pages(unittest.TestCase):
         # and turns from the case as pressed and leaning, springing out as it goes, not from the case at rest
         # ("从默认状态开始的 所以不连贯")
         for part in ('coverLean = tilt; coverLit = CGFloat(lit); detailPress = CGFloat(press)',
-                     'withAnimation(.spring(response: 0.3, dampingFraction: 0.5)) { detailPress = 0 }',
+                     'withAnimation(paced(.spring(response: 0.3, dampingFraction: 0.5))) { detailPress = 0 }',
                      'press: detailPress', 'func pressedScale(_ press: CGFloat) -> CGFloat'):
             self.assertIn(part, flow)
         detail = (REPO / 'tools/builder_app/Sources/MNGBuilder/CaseDetail.swift').read_text()
@@ -152,11 +154,14 @@ class Pages(unittest.TestCase):
                      '.rotation3DEffect(.degrees(settled ? 0 : 180 * Double(p) * CoverFlowGeometry.turnWay)', 'if p < 0.5 {',
                      '.scaleEffect(x: settled ? 1 : -1, y: 1)', 'static var coverShare: CGFloat { 0.44 }'):
             self.assertIn(part, detail)
-        for part in ('CaseDetail(stage: stage, open: open, lean: coverLean, lit: coverLit, press: detailPress, close: { turn(false) })',
+        for part in ('CaseDetail(stage: stage, open: open, lean: coverLean, lit: coverLit, press: detailPress, opening: opening,\n'
+                     '                               inside: inside(index), cartridge: cartridge(index), close: { turn(false) })',
                      'withAnimation(openingTurn) { open = 1; coverLean = .zero; coverLit = 0 }',
-                     'private let openingTurn = Animation.spring(response: 0.46, dampingFraction: 0.69)',
+                     # "去掉 5% 反弹 改成 0%": opening and closing critically damped, no overshoot, either way it opens
+                     'private var openingTurn: Animation { paced(.spring(response: 0.33, dampingFraction: 1)) }',
+                     'private var turnSpring: Animation { paced(.spring(response: 0.4, dampingFraction: 1)) }',
                      'withAnimation(turnSpring, completionCriteria: .removed) { open = 0; coverLean = .zero; coverLit = 0 } completion: {',
-                     'flip: Double(open), hideCenter: expanded',
+                     'flip: opening == .book ? 0 : Double(open), hideCenter: expanded',
                      "including: flipped ? .subviews : .all", 'guard !expanded else { return }'):
             self.assertIn(part, flow)
         self.assertNotIn('openSpring', flow)
@@ -166,7 +171,12 @@ class Pages(unittest.TestCase):
         self.assertIn('detail(index, false)', flow)
         self.assertIn('LinearGradient(colors: [Color(white: 0.17), Color(white: 0.03)], startPoint: .top, endPoint: .bottom)', detail)
         self.assertNotIn('Color(red: 0.12, green: 0.12, blue: 0.13)', detail)
-        self.assertIn('private var buttonWidth: CGFloat { wide ? 200 : .infinity }', home)
+        # "按钮 居然 不整齐 不居中" (2026-11-19): every button the column's width, the column at most 300 ("不要 无限长")
+        self.assertIn('private var buttonWidth: CGFloat { .infinity }', home)
+        self.assertIn('static let column: CGFloat = 300', home)
+        self.assertIn('.frame(maxWidth: wide ? Self.column : .infinity, alignment: .leading)', home)
+        self.assertIn('Text(T.checkShaders).frame(maxWidth: buttonWidth)', home)
+        self.assertIn('Text(T.quickStart).frame(maxWidth: .infinity)', home)
         self.assertNotIn('.frame(maxWidth: wide ? .infinity : nil)', home)   # "极速更新 不要居中了"
         # "封面 要依然支持 鼠标效果": the opened cover leans and lights, laid flat once settled; "去掉 滚动条"
         for part in ('.rotation3DEffect(.degrees(Double(lean.x) * 9)', 'private var settled: Bool { open >= 0.999 }',
@@ -196,8 +206,9 @@ class Pages(unittest.TestCase):
         # it, found on the stage at rest, comes out a little, those beyond move aside, its name floats over it; it stays
         # behind the nearer cases ("效果 太夸张 都出来了": it had come all the way out over them)
         for part in ('let i = stage.cover(at: p)', 'pulls = CaseAmounts.one(side, of: count)',
-                     'pull * w * 0.1', 'CGFloat(pushed(i)) * w * 0.2', 'Text(name(pulled))'):
+                     'pull * w * 0.1', 'CGFloat(pushed(i)) * w * 0.2'):
             self.assertIn(part, flow)
+        self.assertNotIn('Text(name(pulled))', flow)   # "盒子上面的 这个名字 去掉"
         self.assertIn('var drawOrder: [Int] { (0..<count).sorted { abs(place($0).d) > abs(place($1).d) } }', flow)
         # "总是有 卡顿 和 重新调整 的 硬跳": the corner layers are one Canvas per box (not 12 projected views), and the
         # pointer is judged on the stage as shown, with the current pull
@@ -217,7 +228,13 @@ class Pages(unittest.TestCase):
         self.assertNotIn('GameActions(app: app).id(app.app)', home)   # no actions box under the stage any more
         # one state for the three views of a back, read only by the live one
         self.assertIn('GameCardState.of(app.app)', home)
-        self.assertIn('guard live || !state.asked else { return }', home)   # read when the turn starts, no jump
+        # the switches are read before the case opens, so its buttons never move and no Python process runs during
+        # the opening (user 2026-11-19: "mac 第一次打开 这些按钮在动 而且卡，第二次 就好了"); the opened case reads them
+        # again only after its opening animation
+        self.assertIn('await GameCardState.preload(middle + model.installed.map(\\.app))', home)
+        self.assertIn('if !state.loaded { await state.loadSwitches(app.app); return }', home)
+        self.assertIn('try? await Task.sleep(for: .milliseconds(800))', home)
+        self.assertNotIn('state.asked', home)
         self.assertIn('.keyboardShortcut(live ? KeyboardShortcut.defaultAction : nil)', home)
 
     def test_another_game_s_build_page_starts_without_the_files_chosen_before(self):
@@ -237,14 +254,19 @@ class Pages(unittest.TestCase):
         self.assertEqual(home.count('model.buildGame('), 2)
         self.assertNotIn('model.buildFor = ', home)
 
-    def test_a_case_s_picture_is_cut_tall_round_its_title(self):
-        # user 2026-11-17: "图片 重新裁剪 要合适的 长方形": the square picture is cut to a tall rectangle whose middle is
-        # the middle of the title's words and what draws the eye (Vision), not shown whole with a blur under it
+    def test_a_case_s_picture_is_the_square_s_middle_80_percent(self):
+        # user 2026-11-19: "裁剪成 正方形 然后 中间80% 显示在封面上" (replacing 2026-11-17's cut round the title by
+        # Vision; "改成 90%"): the square picture drawn 1 / 0.9 x the insert's height, centred, so the insert shows its middle 90%
+        # (the front moved to CoverArt.swift's CoverFront 2026-11-19, shared with the iPhone / iPad Launcher)
         home = (REPO / 'tools/builder_app/Sources/MNGBuilder/HomePage.swift').read_text()
-        self.assertIn('CroppedPicture(picture: picture, center: crops.center(of: picturePath))', home)
+        self.assertIn('CoverFront(game: game, picture: art?.picture, picturePath: art?.path, center: center)', home)
         art = (REPO / 'tools/builder_app/Sources/MNGBuilder/CoverArt.swift').read_text()
-        for part in ('VNRecognizeTextRequest()', 'VNGenerateAttentionBasedSaliencyImageRequest()', 'Task.detached'):
-            self.assertIn(part, art)
+        self.assertIn('var center: CGFloat = 0.5', art)   # the middle unless covers.json says (Tears of the Kingdom: right)
+        self.assertIn('static var margin: CGFloat { 1 / 0.9 }', art)
+        self.assertIn('CroppedPicture(picture: picture, center: center, margin: margin)', art)
+        for part in ('VNRecognizeTextRequest()', 'VNGenerateAttentionBasedSaliencyImageRequest()', 'crops.center'):
+            self.assertNotIn(part, art)
+        self.assertIn('productImage, shape square', (REPO / 'tools/builder_app/Resources/covers.json').read_text())
         self.assertIn('Text(T.gamePlatforms(game))', (REPO / 'tools/builder_app/Sources/MNGBuilder/CoverFlow.swift').read_text())
 
 
